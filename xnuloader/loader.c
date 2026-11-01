@@ -2610,6 +2610,13 @@ exception_handler(int64_t type, uint64_t *ctx)
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
 	flush_log();
+	if (PLAT == &platform_talkman) {
+		/* no log partition on this phone: the screen is the only record, so it stays up for a minute */
+		uint64_t start = READ_SYSREG(CNTVCT_EL0);
+
+		while (READ_SYSREG(CNTVCT_EL0) - start < 60 * READ_SYSREG(CNTFRQ_EL0)) {
+		}
+	}
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	for (;;) {
 	}
@@ -4507,6 +4514,17 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		run_kernel(0, 0);
+	}
+	if (PLAT == &platform_talkman && !have_payload) {
+		/*
+		 * Bring-up: nothing to boot. What the firmware gives (the memory map, for where a payload and the kernel can
+		 * go) stays on the screen for a minute, then the firmware has the phone back and tries its next boot option:
+		 * a reset here would start this loader again and again, as the default entry of the volume.
+		 */
+		print_memory_map();
+		print("nothing to boot: back to the firmware in 60 s\n");
+		BS->stall(60 * 1000000);
+		return 0x800000000000000EULL;   /* EFI_NOT_FOUND */
 	}
 	reboot();
 	return 0;
