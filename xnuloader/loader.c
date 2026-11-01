@@ -1093,6 +1093,11 @@ log_of_hung_kernel(const struct kernel_live *live, uint64_t slide)
 	uint32_t len, ring_at;
 
 	loader_ctx[CTX_LOG_PA] = loader_ctx[CTX_LOG_LEN] = 0;
+	/* written by the kernel with its caches on: look at memory (see run_on_other_cpu, the heartbeat) */
+	flush_dcache(live->log_len + slide, live->log_len + slide + 4);
+	flush_dcache(live->log_ring_at + slide, live->log_ring_at + slide + 4);
+	flush_dcache(live->log_wrapped + slide, live->log_wrapped + slide + 1);
+	flush_dcache((uint64_t)(uintptr_t)log, (uint64_t)(uintptr_t)log + live->log_head + live->log_ring);
 	len = *(volatile uint32_t *)(live->log_len + slide);
 	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
 	if (*(volatile uint8_t *)(live->log_wrapped + slide) && ring_at < live->log_ring) {
@@ -2486,6 +2491,12 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
+			/*
+			 * The kernel writes its heartbeat with its caches on. Where the firmware's mapping of this memory is
+			 * not shared with the kernel's (the Lumia 950's UEFI), this core's cache keeps the old value for ever:
+			 * look at memory, or a live kernel is taken for a hung one and its storage requests go unserved.
+			 */
+			flush_dcache((uint64_t)(uintptr_t)&live->heartbeat, (uint64_t)(uintptr_t)&live->heartbeat + 8);
 			if (live->heartbeat != last_beat) {
 				last_beat = live->heartbeat;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
