@@ -15,6 +15,8 @@ on:
       - 'xnu-env.sh'
       - 'tools/make-kernel.sh'
       - 'tools/hakios-config.py'
+      - 'configs/**'
+      - 'devices/talkman/**'
       - '.github/workflows/kernel-talkman.yml'
 
 permissions:
@@ -46,6 +48,12 @@ jobs:
 
       - name: Dependencies and SDK
         run: xnu-deps/setup.sh
+
+      - name: The Lumia 950's configuration (no other phone's drivers)
+        run: |
+          python3 tools/hakios-config.py defconfig talkman_defconfig
+          python3 tools/hakios-config.py check
+          grep -E '^CONFIG_(HAKIOS_|DEVICE|UFS)' .config
 
       - name: Build the kernel (GICv2, ARMv8.0)
         run: |
