@@ -1,0 +1,73 @@
+# The Lumia 950 (talkman, MSM8992) kernel: HakiOS's XNU with the GICv2 driver and no PAN (ARMv8.0 cores).
+# A macOS runner, so nobody needs a Mac: xnu/apply.sh fetches Apple's xnu-8796.121.2, xnu-deps/setup.sh links
+# Xcode's cctools and fetches the iPhoneOS 16.5 SDK, tools/make-kernel.sh builds and judges the result.
+name: kernel-talkman
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [talkman]
+    paths:
+      - 'xnu/**'
+      - 'drivers/**'
+      - 'xnu-deps/**'
+      - 'xnu-build.sh'
+      - 'xnu-env.sh'
+      - 'tools/make-kernel.sh'
+      - 'tools/hakios-config.py'
+      - '.github/workflows/kernel-talkman.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-talkman-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kernel:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      HAKIOS_GIC: v2
+      HAKIOS_CPU: v8.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tools
+        run: |
+          brew install autoconf automake flex bison lz4 xz
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          xcode-select -p; clang --version | head -1; python3 --version
+
+      - name: Apple's XNU with HakiOS's patch
+        run: xnu/apply.sh
+
+      - name: Dependencies and SDK
+        run: xnu-deps/setup.sh
+
+      - name: Build the kernel (GICv2, ARMv8.0)
+        run: |
+          set -o pipefail
+          KERNEL_LOG=xnu-build.log tools/make-kernel.sh -j"$(sysctl -n hw.ncpu)"
+
+      - name: First errors, if any
+        if: failure()
+        run: |
+          grep -nE "error:|\*\*\* " xnu-build.log | head -60 || true
+
+      - name: Check the 950 choices made it in
+        run: |
+          file hakios-kernel
+          strings hakios-kernel | grep -m3 -i "gic" || true
+          shasum -a 256 hakios-kernel
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hakios-kernel-talkman
+          path: |
+            hakios-kernel
+            xnu-build.log
+          if-no-files-found: warn
