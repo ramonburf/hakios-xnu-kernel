@@ -348,6 +348,7 @@ compose_logs(const char *klog, uint64_t klog_len)
 }
 
 static int hc_list_is_uefis(void);
+static void vol_write_kernel_log(const char *klog, uint64_t len);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
@@ -359,6 +360,10 @@ write_logs(const char *klog, uint64_t klog_len)
 
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
+		/* No log partition: a phone that logs to its volume (the Lumia 950) keeps the kernel's log there whole */
+		if (klog != NULL && klog_len != 0) {
+			vol_write_kernel_log(klog, klog_len);
+		}
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
 			print("\n== KERNEL LOG ==\n");
@@ -4394,6 +4399,43 @@ vol_log_save(const char *checkpoint)
 	}
 }
 
+/*
+ * The kernel's log, when it comes back (a return, a panic, an early exception), as \EFI\hakios\kernel.log beside
+ * loader.log: whole, made anew each time, flushed. Only where the volume asked for logging (log-here).
+ */
+static void
+vol_write_kernel_log(const char *klog, uint64_t len)
+{
+	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID;
+	static const char16 path[] = u"\\EFI\\hakios\\kernel.log";
+	efi_loaded_image *image = NULL;
+	efi_simple_fs *fs = NULL;
+	efi_file *root = NULL, *file = NULL;
+	efi_status s;
+	uint64_t size = len;
+
+	if (vol_log == NULL ||
+	    EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
+	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL ||
+	    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+		return;
+	}
+	if (!EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && file != NULL) {
+		file->remove(file);
+		file = NULL;
+	}
+	if (EFI_ERROR(s = root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0)) ||
+	    file == NULL) {
+		print("log file: \\EFI\\hakios\\kernel.log cannot be made (%x)\n", s);
+	} else {
+		s = file->write(file, &size, klog);
+		file->flush(file);
+		file->close(file);
+		print("log file: kernel log, %d bytes, into \\EFI\\hakios\\kernel.log (%x)\n", size, s);
+	}
+	root->close(root);
+}
+
 static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
 static const char *volume_payload_note;         /* why not, if it was looked for */
 
@@ -4662,6 +4704,12 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		run_kernel(0, 0);
+		if (PLAT == &platform_talkman) {
+			/* the kernel came back: what it and the loader said stays on the screen, then a reset */
+			vol_log_save("kernel back");
+			print("kernel back: reset in 120 s\n");
+			BS->stall(120 * 1000000);
+		}
 	}
 	if (PLAT == &platform_talkman && !have_payload) {
 		/*
