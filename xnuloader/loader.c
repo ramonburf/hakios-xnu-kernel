@@ -2433,6 +2433,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
 	uint64_t talkman_noted = 0;
+	uint32_t talkman_klog_len = 0;
 	talkman_run_started = started;
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
 	if (PLAT->log_other_cpu) {
@@ -2515,6 +2516,16 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				/* with boot-arg log_poc=1 the kernel cleans its log and heartbeat to memory: the last of it */
 				flush_dcache((uint64_t)(uintptr_t)&live->heartbeat, (uint64_t)(uintptr_t)&live->heartbeat + 8);
 				note_kernel_progress(live, slide, talkman_noted);
+				/* the whole log so far, whenever it has grown, as \EFI\hakios\kernel.log (log_poc=1 makes it readable) */
+				flush_dcache(live->log_len + slide, live->log_len + slide + 4);
+				uint32_t klen = *(volatile uint32_t *)(live->log_len + slide);
+				if (klen != talkman_klog_len && klen <= live->log_head) {
+					const char *klog = (const char *)(live->log + slide);
+
+					flush_dcache((uint64_t)(uintptr_t)klog, (uint64_t)(uintptr_t)klog + klen);
+					vol_write_kernel_log(klog, klen);
+					talkman_klog_len = klen;
+				}
 			}
 			vol_log_note();
 		}
