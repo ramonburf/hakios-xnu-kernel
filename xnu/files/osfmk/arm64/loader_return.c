@@ -135,14 +135,32 @@ loader_log_line(const char *line)
 	__builtin_arm_wsr64("DAIF", daif);
 }
 
+/*
+ * Boot-arg log_poc=1: every character of this log, and where the log has got to, cleaned to the point of coherency as
+ * it is written, and the heartbeat too. For a loader that cannot see what this kernel writes with its caches on (the
+ * Lumia 950's UEFI maps memory so: the loader read a heartbeat stuck at 0 and an empty log from a kernel that was
+ * running), so that it can show the log as it grows -- and keep the last of it when the kernel stops.
+ */
+static TUNABLE(bool, loader_log_to_poc, "log_poc", false);
+
+static inline void
+loader_log_clean(const volatile void *p)
+{
+	__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
+}
+
 static void
 loader_log_put_locked(char c)
 {
+	const volatile char *at = NULL;
+
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
+			at = &loader_log[loader_log_len];
 			loader_log[loader_log_len++] = c;
 		}
 	} else {
+		at = &loader_log[LOADER_LOG_HEAD + loader_log_ring_at];
 		loader_log[LOADER_LOG_HEAD + loader_log_ring_at] = c;
 		if (++loader_log_ring_at == LOADER_LOG_RING) {
 			loader_log_ring_at = 0;
@@ -151,6 +169,15 @@ loader_log_put_locked(char c)
 		if (!loader_log_wrapped) {
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
+	}
+	if (loader_log_to_poc) {
+		if (at != NULL) {
+			loader_log_clean(at);
+		}
+		loader_log_clean(&loader_log_len);
+		loader_log_clean(&loader_log_ring_at);
+		loader_log_clean(&loader_log_wrapped);
+		__asm__ volatile ("dsb sy" : : : "memory");
 	}
 }
 
@@ -580,6 +607,11 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
 		memory_report();
+	}
+	if (loader_log_to_poc) {
+		/* for a loader that cannot see this core's cached writes (log_poc above) */
+		loader_log_clean(&loader_live.heartbeat);
+		__asm__ volatile ("dsb sy" : : : "memory");
 	}
 
 	clock_interval_to_deadline(HV_WDT_PET_SECONDS, NSEC_PER_SEC, &deadline);

@@ -2511,6 +2511,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			    talkman_noted, arrived ? "arrived" : "not arrived", block_shared.answer.served,
 			    block_shared.answer.failed, block_shared.answer.bytes, (uint64_t)block_shared.ask.request,
 			    (uint64_t)block_shared.answer.answered);
+			if (arrived && live != NULL) {
+				/* with boot-arg log_poc=1 the kernel cleans its log and heartbeat to memory: the last of it */
+				flush_dcache((uint64_t)(uintptr_t)&live->heartbeat, (uint64_t)(uintptr_t)&live->heartbeat + 8);
+				note_kernel_progress(live, slide, talkman_noted);
+			}
 			vol_log_note();
 		}
 		if (arrived && PLAT == &platform_talkman) {
