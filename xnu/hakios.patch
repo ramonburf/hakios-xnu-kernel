@@ -2061,7 +2061,7 @@ index 5bd6f23dd10c..252d50062da4 100644
  MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
 -MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
-+MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837 -Xclang -target-feature -Xclang +pan
++MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837 $(if $(filter v8.0,$(HAKIOS_CPU)),-DHAKIOS_ARMV8_0=1,-Xclang -target-feature -Xclang +pan) $(if $(filter v2,$(HAKIOS_GIC)),-DGENERIC_GIC_V2_IRQ=1)
  
  
  #
@@ -2971,7 +2971,7 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,8 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +104,9 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
@@ -2979,6 +2979,7 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/loader_return.c	optional nos_arm_asm
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
++osfmk/arm64/gic_v2_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index 384118e8d7a9..2573d2ebd4e6 100644
@@ -3331,8 +3332,8 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
  	__builtin_arm_isb(ISB_SY);
  }
-+#elif defined(GENERIC_GIC_V3_IRQ)
-+/* Generic boards: Group 1 IRQs through a GICv3, see osfmk/arm64/gic_v3_irq.c */
++#elif defined(GENERIC_GIC_V3_IRQ) || defined(GENERIC_GIC_V2_IRQ)
++/* Generic boards: Group 1 IRQs through a GICv3 or a GICv2, see osfmk/arm64/gic_v3_irq.c, gic_v2_irq.c */
 +extern void gic_v3_irq_cpu_init(void);
 +
 +void
@@ -3381,11 +3382,13 @@ diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
 index d9f0723244e5..53fe4f371d7f 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h
 +++ b/pexpert/pexpert/arm64/BCM2837.h
-@@ -11,6 +11,15 @@
+@@ -11,6 +11,19 @@
  #define BCM2837
  #define BCM2837_BRINGUP
  #define ARM_ARCH_TIMER
++#ifndef GENERIC_GIC_V2_IRQ                  /* a GICv2 board (the Lumia 950) passes -DGENERIC_GIC_V2_IRQ=1 */
 +#define GENERIC_GIC_V3_IRQ                 1 /* interrupts via GICv3 Group 1, see osfmk/arm64/gic_v3_irq.c */
++#endif
 +#define GENERIC_PSCI_SMP                  1 /* more cores are started through PSCI, see osfmk/arm64/psci_smp.c */
 +
 +/*
@@ -3393,11 +3396,13 @@ index d9f0723244e5..53fe4f371d7f 100644
 + * ARMv8.2: they set PSTATE.PAN on every exception entry, so the kernel must
 + * know to lift it around user memory accesses.
 + */
++#ifndef HAKIOS_ARMV8_0                      /* ARMv8.0 cores (Cortex-A53/A57) have no PAN: its MSR traps */
 +#define __ARM_PAN_AVAILABLE__     1
++#endif
  
  #define __ARM_ARCH__              8
  #define __ARM_VMSA__              8
-@@ -22,6 +31,7 @@
+@@ -22,6 +35,7 @@
  #ifndef ASSEMBLER
  
  #define PI3_UART
@@ -3405,7 +3410,7 @@ index d9f0723244e5..53fe4f371d7f 100644
  
  #define PI3_BREAK                               asm volatile("brk #0");
  
-@@ -60,8 +70,11 @@
+@@ -60,8 +74,11 @@
  #define BCM2837_PUT32(addr, value) do { *((volatile uint32_t *) addr) = value; } while(0)
  #define BCM2837_GET32(addr) *((volatile uint32_t *) addr)
  

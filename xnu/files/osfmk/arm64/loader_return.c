@@ -37,7 +37,7 @@
 #define LOADER_LOG_HEAD (256 * 1024)
 #define LOADER_LOG_RING (1024 * 1024)
 
-#if defined(GENERIC_GIC_V3_IRQ)
+#if defined(GENERIC_GIC_V3_IRQ) || defined(GENERIC_GIC_V2_IRQ)
 extern void gic_v3_irq_quiesce(void);
 extern void gic_v3_irq_cpu_shutdown(void);
 #endif
@@ -247,7 +247,7 @@ loader_jump(uint64_t reason, uint64_t code)
 		return;
 	}
 	loader_return_entered = true;
-#if defined(GENERIC_GIC_V3_IRQ)
+#if defined(GENERIC_GIC_V3_IRQ) || defined(GENERIC_GIC_V2_IRQ)
 	gic_v3_irq_quiesce();
 	/*
 	 * With a core of its own (bootcpu=) the kernel does not go back into the loader's code on
