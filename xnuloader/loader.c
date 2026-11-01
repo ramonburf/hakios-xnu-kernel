@@ -4562,12 +4562,14 @@ load_payload_from_volume(void)
 	pages = PAYLOAD_MAX_SIZE / 0x1000;
 	if (address == 0) {
 		/*
-		 * No RAM at the fixed address: 64 MiB below 3 GiB, wherever the firmware has them (UEFI gives the highest
-		 * free pages under the limit, so the start of RAM, where the kernel's window goes, is left alone).
+		 * No RAM at the fixed address (the Lumia 950): 64 MiB as high as the firmware has them below 0xE0000000, the
+		 * end of the phone's 1.5 GB block from 0x80000000 (UEFI gives the highest free pages under the limit). Below
+		 * 3 GiB, as before, put it in the middle of that block and left the kernel 992 MB; at the top, next to the
+		 * loader (LOADER_BASE=0xDE000000 in xnuloader/build.sh), the block stays whole for the kernel.
 		 */
-		address = 0xC0000000ULL - 1;
+		address = 0xE0000000ULL - 1;
 		if (EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 2 /* EfiLoaderData */, pages, &address))) {
-			volume_payload_note = "there are no 64 MiB of free RAM below 3 GiB for the payload";
+			volume_payload_note = "there are no 64 MiB of free RAM below 0xE0000000 for the payload";
 			goto close;
 		}
 		payload_base = address;
