@@ -48,6 +48,7 @@
  */
 #include <mach/mach_types.h>
 #include <kern/debug.h>
+#include <kern/startup.h>
 #include <kern/simple_lock.h>
 #include <os/atomic_private.h>
 #include <arm/cpu_data_internal.h>
@@ -92,7 +93,14 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+/*
+ * The EL1 virtual timer's PPI. 27 is ARM's usual number, but a SoC may wire the generic timer elsewhere: Qualcomm's
+ * MSM8992/MSM8994 put the four timers on 17..20 (hypervisor 17, secure 18, non-secure 19, virtual 20: the Lumia 950's
+ * ACPI GTDT, and Linux's arch_timer on interrupt 20). With 27 the clock interrupt never came, and the kernel stopped
+ * at the first thing that waited for a time. Boot-arg vtimer_ppi=N (16..31) says which.
+ */
+static TUNABLE(uint32_t, gic_vtimer_ppi, "vtimer_ppi", 27);
+#define GIC_INTID_VTIMER        (gic_vtimer_ppi >= 16 && gic_vtimer_ppi <= 31 ? gic_vtimer_ppi : 27u)
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS      1023        /* GICv2: "end of interrupts for this processor" (0x3ff) */
 #define GIC_SPI_MOST            48          /* attached at a time */
