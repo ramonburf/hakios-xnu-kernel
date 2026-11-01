@@ -396,11 +396,6 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			break;
 		}
 		gic_active_iar[cpu] = iar;
-		{
-			extern void redwood_wake_irq(int cpu, uint32_t intid);
-
-			redwood_wake_irq(cpu, intid);   /* what wakes the cores (psci_smp.c) */
-		}
 
 		if (intid == GIC_INTID_VTIMER) {
 			/* same sequence as the FIQ path in sleh_fiq() */
