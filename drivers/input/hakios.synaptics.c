@@ -39,6 +39,54 @@ extern kern_return_t thread_terminate(thread_t thread);
 
 static vm_offset_t gcc, tlmm, qup;
 
+/*
+ * Everything the driver says is also kept, and said again once a minute for its first ten minutes:
+ * the probe runs in the first half minute of a boot, and on the 950 the kernel's log buffer has been
+ * overwritten by then (boot 14: nothing before 102 s was left).
+ */
+static char history[6144];
+static size_t history_length;
+
+static void
+repeat_history(void)
+{
+	const char *line = history;
+
+	printf("synaptics: --- what it said so far, again ---\n");
+	while (line < history + history_length) {
+		int length = 0;
+
+		while (line + length < history + history_length && line[length] != '\n') {
+			length++;
+		}
+		printf("%.*s (again)\n", length, line);
+		line += length + 1;
+	}
+}
+
+static int
+say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+	int length;
+
+	va_start(list, format);
+	length = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	printf("%s", line);
+	if (length > 0) {
+		size_t n = strnlen(line, sizeof(line));
+
+		if (history_length + n < sizeof(history)) {
+			memcpy(history + history_length, line, n);
+			history_length += n;
+		}
+	}
+	return length;
+}
+#define printf say
+
 static inline uint32_t
 rd(vm_offset_t address)
 {
@@ -673,10 +721,21 @@ synaptics_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	sleep_ms(delay_s * 1000);
 
-	if (!bring_up()) {
-		printf("synaptics: no touch screen\n");
-		thread_terminate(current_thread());
-		return;
+	printf("synaptics: probing (poll %u us, checkpoints %u ms)\n", poll_us, checkpoint_ms);
+	/* three more tries a minute apart (the controller may not have been ready), then ten minutes of saying why not */
+	for (unsigned attempt = 1; !bring_up(); attempt++) {
+		printf("synaptics: no touch screen (attempt %u)\n", attempt);
+		checkpoint_ms = 0;
+		if (attempt == 4) {
+			for (int i = 0; i < 10; i++) {
+				sleep_ms(60000);
+				repeat_history();
+			}
+			thread_terminate(current_thread());
+			return;
+		}
+		sleep_ms(60000);
+		repeat_history();
 	}
 	printf("synaptics: touch screen ready; %s every %u us\n",
 	    use_attention ? "the attention line is looked at" : "the objects are read (no interrupt)", poll_us);
@@ -694,6 +753,9 @@ synaptics_thread(__unused void *parameter, __unused wait_result_t result)
 			printf("synaptics: so far %u object reads in %u looks (%u failed), %u finger positions, the last at %u, %u;"
 			    " attention line %s\n", seen.reads, seen.looks, seen.bad, seen.touches, seen.last_x, seen.last_y,
 			    attention() ? "low" : "high");
+			if (tick / (60 * (1000000 / poll_us)) <= 10) {
+				repeat_history();
+			}
 		}
 		sleep_us(poll_us);
 	}
