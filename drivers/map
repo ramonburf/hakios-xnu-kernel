@@ -13,6 +13,7 @@ input    bsd/dev/hakios.focaltech_fw.h
 input    bsd/dev/hakios.input.c
 input    bsd/dev/hakios.buttons.c
 input    bsd/dev/hakios.virtio_input.c
+input    bsd/dev/hakios.synaptics.c
 
 storage  bsd/dev/hakios.ufs.c
 storage  bsd/dev/hakios.ufshc.c

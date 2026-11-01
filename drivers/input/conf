@@ -14,6 +14,12 @@ driver GOODIX
 	help    the touch screen: a Goodix GT9916 ("Berlin-D") or a FocalTech FT3680 on SPI (touchscreen=1). The bus,
 	help    pins and supplies are the POCO X5 Pro's; another phone with one of these controllers changes those
 
+driver SYNAPTICS
+	file    bsd/dev/hakios.synaptics.c
+	default n
+	help    the Lumia 950's touch screen: a Synaptics RMI4 controller on I2C, BLSP1 QUP1 (touchscreen=1). The bus,
+	help    pins and clocks are MSM8992's; only a device that has them builds it
+
 driver BUTTONS
 	file    bsd/dev/hakios.buttons.c
 	help    the power and volume keys, read from the PMIC through the SPMI arbiter (buttons=1)

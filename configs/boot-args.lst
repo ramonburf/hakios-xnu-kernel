@@ -147,6 +147,7 @@ haptic	k
 haptic_effect	k
 hv_wdt_pet	k
 loader_return_after	kl
+log_poc	k
 machine_name	k
 membench	k
 metal	ku
@@ -260,6 +261,8 @@ thermal_tm1	k
 torch	kl
 torch_max_s	k
 torch_secs	k
+touch_checkpoint_ms	k
+touch_delay_s	k
 touch_flip	k
 touch_lat	ku
 touch_poll_us	k
@@ -294,6 +297,7 @@ virtio_blk	k
 virtio_input	k
 virtio_net	k
 virtio_sound	k
+vtimer_ppi	k
 wifi	k
 wifi_again	k
 wifi_ask	k
