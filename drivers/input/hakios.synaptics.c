@@ -112,17 +112,30 @@ sleep_ms(uint32_t ms)
 	delay_for_interval(ms, NSEC_PER_MSEC);
 }
 
-/* Wait for a register to read `want` under `mask`, looking every 10 us; false after `tries` looks. */
-static bool
-wait_reg(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t tries)
+static uint64_t
+deadline_us(uint32_t us)
 {
-	while (tries--) {
+	uint64_t deadline;
+
+	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
+	return deadline;
+}
+
+/*
+ * Wait up to `us` microseconds for a register to read `want` under `mask`. It spins: a sleep of 10 us
+ * took ~75 us on the 950 (boot 15), which made every wait seven times as long as it said.
+ */
+static bool
+wait_reg(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t us)
+{
+	uint64_t deadline = deadline_us(us);
+
+	do {
 		if ((rd(address) & mask) == want) {
 			return true;
 		}
-		sleep_us(10);
-	}
-	return false;
+	} while (mach_absolute_time() < deadline);
+	return (rd(address) & mask) == want;
 }
 
 static uint32_t checkpoint_ms = 11000;
@@ -298,7 +311,8 @@ attention(void)
 #define TAG_WRITE               0x82
 #define TAG_WRITE_STOP          0x83
 #define TAG_READ_STOP           0x87
-#define MAX_READ                60      /* and two tag bytes: the 64-byte input FIFO */
+#define OP_OUTPUT_NOT_EMPTY     (1u << 4)
+#define MAX_READ                12      /* and two tag bytes; 56 at once failed on the 950 (boot 15), 10 never did */
 
 #define TOUCH_ADDRESS           0x4b
 
@@ -307,20 +321,22 @@ static uint32_t bus_clock = CLK_100K;
 static bool
 qup_state(uint32_t state)
 {
-	if (!wait_reg(QUP_STATE, STATE_VALID, STATE_VALID, 20000)) {
+	if (!wait_reg(QUP_STATE, STATE_VALID, STATE_VALID, 2000)) {
 		return false;
 	}
 	wr(QUP_STATE, state);
-	return wait_reg(QUP_STATE, STATE_VALID | STATE_MASK, STATE_VALID | state, 20000);
+	return wait_reg(QUP_STATE, STATE_VALID | STATE_MASK, STATE_VALID | state, 2000);
 }
 
 static bool
-qup_init(void)
+qup_init(bool verbose)
 {
-	printf("synaptics: qup version %#x, state %#x, io modes %#x, i2c status %#x\n", rd(QUP_HW_VERSION), rd(QUP_STATE),
-	    rd(QUP_IO_MODES), rd(QUP_I2C_STATUS));
+	if (verbose) {
+		printf("synaptics: qup version %#x, state %#x, io modes %#x, i2c status %#x\n", rd(QUP_HW_VERSION), rd(QUP_STATE),
+		    rd(QUP_IO_MODES), rd(QUP_I2C_STATUS));
+	}
 	wr(QUP_SW_RESET, 1);
-	if (!wait_reg(QUP_STATE, STATE_VALID | STATE_MASK, STATE_VALID | STATE_RESET, 20000) || !qup_state(STATE_RESET)) {
+	if (!wait_reg(QUP_STATE, STATE_VALID | STATE_MASK, STATE_VALID | STATE_RESET, 2000) || !qup_state(STATE_RESET)) {
 		printf("synaptics: the qup does not reach its reset state (%#x)\n", rd(QUP_STATE));
 		return false;
 	}
@@ -368,85 +384,129 @@ qup_start(const uint8_t *tx, uint32_t length, uint32_t read_count, bool output_o
 	return qup_state(STATE_RUN);
 }
 
-/* Clear what the transfer left and go back to the reset state. */
+static struct {
+	uint32_t failures, recoveries;
+} bus;
+
+/*
+ * Clear what the transfer left and go back to the reset state. After a failed transfer the QUP is
+ * reset and set up again: on boot 15 one failed read left it refusing every transfer after it.
+ */
 static void
-qup_finish(uint32_t status)
+qup_finish(uint32_t status, bool ok, const char *what)
 {
-	uint32_t errors = rd(QUP_ERROR_FLAGS);
+	uint32_t errors = rd(QUP_ERROR_FLAGS), operational = rd(QUP_OPERATIONAL), state = rd(QUP_STATE);
 
 	wr(QUP_I2C_STATUS, status & I2C_STATUS_ERRORS);
 	wr(QUP_ERROR_FLAGS, errors & 0x3c);
-	wr(QUP_OPERATIONAL, rd(QUP_OPERATIONAL) & OP_SERVICE_FLAGS);
+	wr(QUP_OPERATIONAL, operational & OP_SERVICE_FLAGS);
 	wr(QUP_CONFIG, rd(QUP_CONFIG) & ~CONFIG_NO_INPUT);
-	qup_state(STATE_RESET);
+	if (ok && qup_state(STATE_RESET)) {
+		return;
+	}
+	if (bus.failures++ < 30) {
+		printf("synaptics: %s failed: i2c status %#x (%s%s%s%s), operational %#x, errors %#x, state %#x\n", what, status,
+		    (status & I2C_STATUS_NACK) ? "no acknowledge " : "", (status & (1u << 2)) ? "bus error " : "",
+		    (status & (1u << 4)) ? "arbitration lost " : "", (status & I2C_STATUS_BUS_ACTIVE) ? "bus active" : "",
+		    operational, errors, state);
+	}
+	if (qup_init(false)) {
+		bus.recoveries++;
+	}
 }
 
-/* Write `reg`, repeated start, read `count` bytes. */
+/* Write `reg`, repeated start, read `count` bytes (up to MAX_READ). */
 static bool
-i2c_read(uint8_t reg, uint8_t *out, uint32_t count, uint32_t *status_out)
+i2c_read_one(uint8_t reg, uint8_t *out, uint32_t count, uint32_t *status_out)
 {
 	const uint8_t tx[] = { TAG_START, TOUCH_ADDRESS << 1, TAG_WRITE, 1, reg,
 		               TAG_START, TOUCH_ADDRESS << 1 | 1, TAG_READ_STOP, (uint8_t)count };
 	uint32_t status = 0;
-	bool done = false;
+	bool done = false, ok;
+	uint64_t deadline;
 
 	*status_out = 0;
-	if (count == 0 || count > MAX_READ || !qup_start(tx, sizeof(tx), count + 2, false)) {
+	if (count == 0 || count > MAX_READ) {
 		return false;
 	}
-	for (int i = 0; i < 5000 && !done; i++) {       /* 50 ms; 60 bytes at 100 kHz take ~7 ms */
+	if (!qup_start(tx, sizeof(tx), count + 2, false)) {
+		qup_finish(rd(QUP_I2C_STATUS), false, "starting a read");
+		return false;
+	}
+	deadline = deadline_us(5000);   /* 14 bytes at 100 kHz take 1.3 ms */
+	do {
 		status = rd(QUP_I2C_STATUS);
 		if (status & I2C_STATUS_ERRORS) {
 			break;
 		}
 		done = rd(QUP_OPERATIONAL) & OP_MAX_INPUT_DONE;
-		if (!done) {
-			sleep_us(10);
-		}
-	}
+	} while (!done && mach_absolute_time() < deadline);
 	if (done) {
-		uint8_t in[64];
+		uint8_t in[MAX_READ + 2 + 3];
 
 		/* the input FIFO starts with the read's two tag bytes */
 		for (uint32_t i = 0; i < count + 2; i += 4) {
 			uint32_t word = rd(QUP_IN_FIFO);
 
-			for (uint32_t b = 0; b < 4 && i + b < sizeof(in); b++) {
+			for (uint32_t b = 0; b < 4; b++) {
 				in[i + b] = (uint8_t)(word >> (8 * b));
 			}
 		}
 		memcpy(out, in + 2, count);
 	}
-	qup_finish(status);
+	ok = done && !(status & I2C_STATUS_ERRORS);
+	qup_finish(status, ok, done ? "a read" : "a read (timed out)");
 	*status_out = status;
-	return done && !(status & I2C_STATUS_ERRORS);
+	return ok;
+}
+
+/* Any length: RMI4 registers follow on from each other, so a long read is several short ones. */
+static bool
+i2c_read(uint8_t reg, uint8_t *out, uint32_t count, uint32_t *status_out)
+{
+	for (uint32_t done = 0; done < count; ) {
+		uint32_t n = count - done > MAX_READ ? MAX_READ : count - done;
+
+		if (!i2c_read_one((uint8_t)(reg + done), out + done, n, status_out)) {
+			return false;
+		}
+		done += n;
+	}
+	return true;
 }
 
 static bool
 i2c_write(uint8_t reg, uint8_t value, uint32_t *status_out)
 {
 	const uint8_t tx[] = { TAG_START, TOUCH_ADDRESS << 1, TAG_WRITE_STOP, 2, reg, value };
-	uint32_t status = 0;
-	bool done = false;
+	uint32_t status = 0, operational = 0;
+	bool done = false, ok;
+	uint64_t deadline, settled;
 
 	*status_out = 0;
 	if (!qup_start(tx, sizeof(tx), 0, true)) {
+		qup_finish(rd(QUP_I2C_STATUS), false, "starting a write");
 		return false;
 	}
-	for (int i = 0; i < 5000 && !done; i++) {
+	deadline = deadline_us(5000);
+	settled = deadline_us(300);     /* six bytes at 400 kHz take 150 us: by then the bus has been seen busy */
+	do {
 		status = rd(QUP_I2C_STATUS);
 		if (status & I2C_STATUS_ERRORS) {
 			break;
 		}
-		/* MAX_OUTPUT_DONE can come before the bus is done (i2c-msm-v2.c): wait for it to go idle as well */
-		done = (rd(QUP_OPERATIONAL) & OP_MAX_OUTPUT_DONE) && !(status & I2C_STATUS_BUS_ACTIVE);
-		if (!done) {
-			sleep_us(10);
-		}
-	}
-	qup_finish(status);
+		/*
+		 * Done when the output FIFO is empty and the bus is idle again after the stop. MAX_OUTPUT_DONE
+		 * alone is not it: boot 15's write of F01's interrupt enable never saw it and timed out.
+		 */
+		operational = rd(QUP_OPERATIONAL);
+		done = !(operational & OP_OUTPUT_NOT_EMPTY) && !(status & I2C_STATUS_BUS_ACTIVE) &&
+		    ((operational & OP_MAX_OUTPUT_DONE) || mach_absolute_time() > settled);
+	} while (!done && mach_absolute_time() < deadline);
+	ok = done && !(status & I2C_STATUS_ERRORS);
+	qup_finish(status, ok, done ? "a write" : "a write (timed out)");
 	*status_out = status;
-	return done && !(status & I2C_STATUS_ERRORS);
+	return ok;
 }
 
 /* ---- the RMI4 controller ----------------------------------------------------------------------------- */
@@ -555,17 +615,36 @@ f12_layout(void)
 	printf("synaptics: F12 q5 %02x %02x %02x %02x %02x, q8 %02x %02x %02x, objects at %#x, sensor up to %u x %u; F01 status %#x"
 	    " control %#x (sleep mode %u) interrupt enable %#x (F12's %#x)\n", q5[0], q5[1], q5[2], q5[3], q5[4], q8[0], q8[1],
 	    q8[2], f12.data, max_x, max_y, f01_status, f01_ctrl[0], f01_ctrl[0] & 3, f01_ctrl[1], f12_irq_mask);
-	if (f01_ctrl[0] & 3) {
-		/* asleep: back to normal operation */
-		i2c_write(f01.control, (uint8_t)(f01_ctrl[0] & ~3u), &status);
-		printf("synaptics: F01 woken from sleep mode %u (i2c status %#x)\n", f01_ctrl[0] & 3, status);
+	/*
+	 * Awake (sleep mode 0), and "configured" (bit 7): F01's status says "unconfigured" (bit 7) after a
+	 * reset until the host sets it, as synaptics_rmi4_reset_device does. Then F12's interrupt enabled.
+	 */
+	if ((f01_ctrl[0] & 3) || !(f01_ctrl[0] & 0x80)) {
+		bool ok = i2c_write(f01.control, (uint8_t)((f01_ctrl[0] & ~3u) | 0x80), &status);
+		uint8_t now = 0;
+
+		i2c_read(f01.control, &now, 1, &status);
+		printf("synaptics: F01 control %#x -> %#x (write %s)\n", f01_ctrl[0], now, ok ? "done" : "failed");
 	}
 	if ((f01_ctrl[1] & f12_irq_mask) != f12_irq_mask) {
-		i2c_write((uint8_t)(f01.control + 1), (uint8_t)(f01_ctrl[1] | f12_irq_mask), &status);
-		i2c_read((uint8_t)(f01.control + 1), &f01_ctrl[1], 1, &status);
-		printf("synaptics: F12's interrupts enabled: %#x\n", f01_ctrl[1]);
+		bool ok = i2c_write((uint8_t)(f01.control + 1), (uint8_t)(f01_ctrl[1] | f12_irq_mask), &status);
+		uint8_t now = 0;
+
+		if (i2c_read((uint8_t)(f01.control + 1), &now, 1, &status)) {
+			f01_ctrl[1] = now;
+		}
+		printf("synaptics: F01 interrupt enable now %#x (write %s)\n", f01_ctrl[1], ok ? "done" : "failed");
 	}
 	use_attention = (f01_ctrl[1] & f12_irq_mask) == f12_irq_mask;
+	{
+		uint8_t irq = 0;
+
+		/* reading the interrupt status clears it: the attention line goes high until there is news */
+		i2c_read((uint8_t)(f01.data + 1), &irq, 1, &status);
+		i2c_read(f01.data, &f01_status, 1, &status);
+		printf("synaptics: F01 interrupt status was %#x, status now %#x, attention line %s; I2C %u failed, %u recovered\n",
+		    irq, f01_status, attention() ? "low" : "high", bus.failures, bus.recoveries);
+	}
 	return true;
 }
 
@@ -584,23 +663,25 @@ static uint32_t flip;           /* boot-arg touch_flip: 1 = mirror left-right, 2
 static void
 f12_report(void)
 {
-	static unsigned shown, failed;
-	uint8_t objects[MAX_FINGERS * OBJECT_BYTES];
+	static unsigned shown;
+	uint8_t o[OBJECT_BYTES];
 	uint32_t status;
 
 	seen.reads++;
-	/* two reads: the input FIFO holds 60 bytes, ten objects are 80 */
-	if (!i2c_read(f12.data, objects, 7 * OBJECT_BYTES, &status) ||
-	    !i2c_read((uint8_t)(f12.data + 7 * OBJECT_BYTES), objects + 7 * OBJECT_BYTES, (MAX_FINGERS - 7) * OBJECT_BYTES,
-	    &status)) {
-		seen.bad++;
-		if (failed++ < 20) {
-			printf("synaptics: object read failed (i2c status %#x)\n", status);
-		}
-		return;
-	}
+	/*
+	 * One object per read, and only as far as there are fingers: an empty slot with no finger down in
+	 * any slot after it ends the report. The controller fills the slots from the first.
+	 */
 	for (uint32_t id = 0; id < MAX_FINGERS; id++) {
-		const uint8_t *o = objects + id * OBJECT_BYTES;
+		bool later_down = false;
+
+		for (uint32_t j = id + 1; j < MAX_FINGERS; j++) {
+			later_down |= contact[j].down;
+		}
+		if (!i2c_read((uint8_t)(f12.data + id * OBJECT_BYTES), o, OBJECT_BYTES, &status)) {
+			seen.bad++;
+			return;
+		}
 		/* object type: 0 none, 1 finger, 2 stylus, 3 palm, 5 glove, 6 hovering finger */
 		bool touching = o[0] == 1 || o[0] == 2 || o[0] == 5;
 		uint32_t x = (uint32_t)(o[1] | o[2] << 8), y = (uint32_t)(o[3] | o[4] << 8);
@@ -610,6 +691,9 @@ f12_report(void)
 			if (contact[id].down) {
 				contact[id].down = false;
 				hakios_touch_post(HAKIOS_TOUCH_UP, id, contact[id].x, contact[id].y);
+			}
+			if (!later_down) {
+				break;
 			}
 			continue;
 		}
@@ -683,7 +767,7 @@ bring_up(void)
 	pins_for_bus();
 	show_pins();
 	checkpoint("first access to the qup");
-	if (!qup_init()) {
+	if (!qup_init(true)) {
 		return false;
 	}
 	printf("synaptics: reading the page description table at %#x\n", TOUCH_ADDRESS);
@@ -751,8 +835,8 @@ synaptics_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (tick % (60 * (1000000 / poll_us)) == 0) {
 			printf("synaptics: so far %u object reads in %u looks (%u failed), %u finger positions, the last at %u, %u;"
-			    " attention line %s\n", seen.reads, seen.looks, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    attention() ? "low" : "high");
+			    " attention line %s; I2C %u failed, %u recovered\n", seen.reads, seen.looks, seen.bad, seen.touches,
+			    seen.last_x, seen.last_y, attention() ? "low" : "high", bus.failures, bus.recoveries);
 			if (tick / (60 * (1000000 / poll_us)) <= 10) {
 				repeat_history();
 			}
