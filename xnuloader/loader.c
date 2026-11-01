@@ -4318,9 +4318,10 @@ is_talkman_cpu(void)
 }
 
 /*
- * A log file on the loader's own volume, for the phone with no logdump partition (the Lumia 950):
+ * A log file on the loader's own volume, for a phone with no logdump partition (the Lumia 950):
  * \EFI\hakios\loader.log, made anew at each start and written whole, flushed, at every checkpoint, so that a
- * reset leaves the last checkpoint reached on the volume. Only on that phone; nothing else is written there.
+ * reset leaves the last checkpoint reached on the volume. Only where the volume asks for it with the file
+ * \EFI\hakios\log-here (put there by hand): then it is the loader's first act, before it knows the platform.
  */
 static efi_file *vol_log;
 
@@ -4328,20 +4329,21 @@ static void
 vol_log_open(void)
 {
 	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID;
-	static const char16 dir_path[] = u"\\EFI\\hakios", path[] = u"\\EFI\\hakios\\loader.log";
+	static const char16 marker_path[] = u"\\EFI\\hakios\\log-here", path[] = u"\\EFI\\hakios\\loader.log";
 	efi_loaded_image *image = NULL;
 	efi_simple_fs *fs = NULL;
-	efi_file *root = NULL, *dir = NULL, *file = NULL;
+	efi_file *root = NULL, *marker = NULL, *file = NULL;
 
 	if (EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
 	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL ||
 	    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
 		return;
 	}
-	if (!EFI_ERROR(root->open(root, &dir, dir_path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
-	    EFI_FILE_DIRECTORY)) && dir != NULL) {
-		dir->close(dir);
+	if (EFI_ERROR(root->open(root, &marker, marker_path, EFI_FILE_MODE_READ, 0)) || marker == NULL) {
+		root->close(root);
+		return;
 	}
+	marker->close(marker);
 	/* an old log goes first: a shorter new one written over it would keep the old one's tail */
 	if (!EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && file != NULL) {
 		file->remove(file);
@@ -4523,10 +4525,30 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	vol_log_open();
+	if (vol_log != NULL) {
+		/*
+		 * Asked to log on this volume: first a mark anyone can see that this loader runs at all, a blue band over
+		 * the top of the firmware's framebuffer, then the first checkpoint, before anything this port has to guess.
+		 */
+		efi_gop *gop = NULL;
+
+		if (!EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&gop)) && gop != NULL && gop->mode != NULL &&
+		    gop->mode->info != NULL && gop->mode->fb_base != 0) {
+			uint32_t *fb = (uint32_t *)(uintptr_t)gop->mode->fb_base;
+			uint64_t line = gop->mode->info->pixels_per_scanline, rows = gop->mode->info->height / 8;
+
+			for (uint64_t i = 0; i < line * rows; i++) {
+				fb[i] = 0x000040FFu;    /* blue in both BGRX and RGBX: mostly blue, a little green */
+			}
+		}
+		print("== XNULOADER: log on this volume ==\n");
+		print("MIDR=%x talkman cores: %s\n", READ_SYSREG(MIDR_EL1), is_talkman_cpu() ? "yes" : "no");
+		vol_log_save("first");
+	}
 	int talkman = is_talkman_cpu();
 
 	if (talkman) {
-		vol_log_open();
 		print("== XNULOADER (talkman bring-up) ==\n");
 		print("firmware: %d.%d, revision %x; MIDR=%x PFR0=%x MMFR1=%x CurrentEL=%x\n",
 		    (uint64_t)(ST->hdr.revision >> 16), (uint64_t)(ST->hdr.revision & 0xffff), (uint64_t)ST->revision,
@@ -4581,6 +4603,9 @@ efi_main(efi_handle image, efi_system_table *st)
 			    (uint64_t)GOP->mode->info->pixels_per_scanline);
 		} else if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (ram_covers(FW_CFG_BASE, 0x1000)) {
+			/* RAM where QEMU has fw_cfg: not QEMU, and writing there could hit memory the secure world guards */
+			print("not QEMU (RAM at its fw_cfg address %x): the firmware's framebuffer is kept\n", FW_CFG_BASE);
 		} else {
 			ramfb_phone_screen();
 		}
