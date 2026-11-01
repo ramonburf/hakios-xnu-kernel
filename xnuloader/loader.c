@@ -2490,7 +2490,21 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			charger_poll();
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
-		if (arrived && live != NULL) {
+		if (arrived && PLAT == &platform_talkman) {
+			/*
+			 * The Lumia 950's UEFI maps memory so that what the kernel writes with its caches on never reaches
+			 * this core, cleaned and invalidated or not (four boots: a heartbeat stuck at 0, an empty log,
+			 * while the kernel's console showed it running). Only what is written with caches off arrives
+			 * (the start, the return) -- and the storage requests, which the kernel writes uncached for that
+			 * reason. So silence proves nothing here: keep serving the storage, and call the kernel hung only
+			 * once it is two minutes past the time it said it would come back (loader_return_after).
+			 */
+			if (seconds_since(started) >= budget + 120) {
+				print("the kernel is %d s past its return time (%d s): taken for hung\n",
+				    seconds_since(started) - budget, budget);
+				status = OTHER_CPU_HUNG;
+			}
+		} else if (arrived && live != NULL) {
 			/*
 			 * The kernel writes its heartbeat with its caches on. Where the firmware's mapping of this memory is
 			 * not shared with the kernel's (the Lumia 950's UEFI), this core's cache keeps the old value for ever:
