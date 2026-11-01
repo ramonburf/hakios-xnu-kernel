@@ -1696,6 +1696,10 @@ _Static_assert(__builtin_offsetof(struct loader_block, ask) == 128,
 
 /* (8 KB is as far as this target aligns; the kernel maps whole 16 KB pages around both) */
 static struct loader_block block_shared __attribute__((aligned(0x2000)));
+/* talkman bring-up: storage requests noted before they are served, and when the run began */
+static uint32_t talkman_requests;
+static uint64_t talkman_run_started;
+static void vol_log_note(void);
 static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
@@ -2225,6 +2229,13 @@ block_poll(void)
 	op = block_shared.ask.op;
 	started = READ_SYSREG(CNTVCT_EL0);
 	bytes = 0;
+	if (PLAT == &platform_talkman && talkman_requests++ < 8) {
+		/* bring-up: which request, written out before UEFI's driver is called, in case that call never returns */
+		print("ufs: request %d: %s (part %d) block %d count %d op %d, at %d s of the run\n", (uint64_t)request,
+		    part < block_shared.parts ? block_shared.part[part].name : "?", (uint64_t)part, lba, count, (uint64_t)op,
+		    seconds_since(talkman_run_started));
+		vol_log_note();
+	}
 	if (part < block_shared.parts && count != 0 && count <= BLOCK_BUFFER_SIZE / block_shared.part[part].block_size &&
 	    lba < block_shared.part[part].blocks && count <= block_shared.part[part].blocks - lba) {
 		efi_block_io *bio = block_bios[part];
@@ -2421,6 +2432,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+	uint64_t talkman_noted = 0;
+	talkman_run_started = started;
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
 	if (PLAT->log_other_cpu) {
 		flush_log();
@@ -2489,6 +2502,16 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
 			charger_poll();
 			last_battery = READ_SYSREG(CNTVCT_EL0);
+		}
+		if (PLAT == &platform_talkman && seconds_since(started) >= talkman_noted + 10) {
+			/* bring-up: what the storage service has done, on the volume every 10 s (a freeze keeps the last) */
+			talkman_noted = seconds_since(started);
+			flush_dcache((uint64_t)(uintptr_t)&block_shared.ask, (uint64_t)(uintptr_t)&block_shared.ask + sizeof(block_shared.ask));
+			print("%d s: kernel %s; storage: %d served, %d failed, %d bytes; last request %d, answered %d\n",
+			    talkman_noted, arrived ? "arrived" : "not arrived", block_shared.answer.served,
+			    block_shared.answer.failed, block_shared.answer.bytes, (uint64_t)block_shared.ask.request,
+			    (uint64_t)block_shared.answer.answered);
+			vol_log_note();
 		}
 		if (arrived && PLAT == &platform_talkman) {
 			/*
@@ -4398,6 +4421,21 @@ vol_log_open(void)
 	}
 	root->close(root);
 	vol_log = file;
+}
+
+/* The log written out now, with no pause: for notes while the kernel runs (each costs a write through UEFI's FAT). */
+static void
+vol_log_note(void)
+{
+	uint64_t size = log_len;
+
+	if (vol_log == NULL) {
+		return;
+	}
+	if (EFI_ERROR(vol_log->set_position(vol_log, 0)) || EFI_ERROR(vol_log->write(vol_log, &size, log_buf)) ||
+	    EFI_ERROR(vol_log->flush(vol_log))) {
+		vol_log = NULL;
+	}
 }
 
 static void
