@@ -4291,7 +4291,8 @@ ram_covers(uint64_t base, uint64_t size)
 	uint32_t desc_ver;
 
 	if (EFI_ERROR(BS->get_memory_map(&map_size, map_buf, &map_key, &desc_size, &desc_ver))) {
-		return 1;                       /* not known: as before this check existed */
+		print("ram_covers: GetMemoryMap failed\n");
+		return 0;                       /* not known: say no, a read of memory that is not there faults */
 	}
 	for (uint64_t off = 0; off < map_size && need < base + size; off += desc_size) {
 		const efi_memory_descriptor *d = (const efi_memory_descriptor *)(map_buf + off);
@@ -4333,13 +4334,23 @@ vol_log_open(void)
 	efi_loaded_image *image = NULL;
 	efi_simple_fs *fs = NULL;
 	efi_file *root = NULL, *marker = NULL, *file = NULL;
+	efi_status s;
 
-	if (EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
-	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL ||
-	    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+	/* each step's status on the screen on the Lumia 950, where this log is the only record there is */
+	if (EFI_ERROR(s = BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL) {
+		print("log file: no loaded-image protocol (%x)\n", s);
 		return;
 	}
-	if (EFI_ERROR(root->open(root, &marker, marker_path, EFI_FILE_MODE_READ, 0)) || marker == NULL) {
+	if (EFI_ERROR(s = BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL) {
+		print("log file: the loader's device has no file system (%x)\n", s);
+		return;
+	}
+	if (EFI_ERROR(s = fs->open_volume(fs, &root)) || root == NULL) {
+		print("log file: the volume does not open (%x)\n", s);
+		return;
+	}
+	if (EFI_ERROR(s = root->open(root, &marker, marker_path, EFI_FILE_MODE_READ, 0)) || marker == NULL) {
+		print("log file: no \\EFI\\hakios\\log-here (%x): not asked for\n", s);
 		root->close(root);
 		return;
 	}
@@ -4349,8 +4360,11 @@ vol_log_open(void)
 		file->remove(file);
 		file = NULL;
 	}
-	if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+	if (EFI_ERROR(s = root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+		print("log file: \\EFI\\hakios\\loader.log cannot be made (%x)\n", s);
 		file = NULL;
+	} else {
+		print("log file: \\EFI\\hakios\\loader.log open\n");
 	}
 	root->close(root);
 	vol_log = file;
@@ -4361,10 +4375,17 @@ vol_log_save(const char *checkpoint)
 {
 	uint64_t size;
 
+	if (is_talkman_cpu()) {
+		/* bring-up on the Lumia 950: each checkpoint stays on the screen long enough to be read or photographed */
+		print("[checkpoint %s]\n", checkpoint);
+		BS->stall(5 * 1000000);
+	}
 	if (vol_log == NULL) {
 		return;
 	}
-	print("[checkpoint %s]\n", checkpoint);
+	if (!is_talkman_cpu()) {
+		print("[checkpoint %s]\n", checkpoint);
+	}
 	size = log_len;
 	if (EFI_ERROR(vol_log->set_position(vol_log, 0)) || EFI_ERROR(vol_log->write(vol_log, &size, log_buf)) ||
 	    EFI_ERROR(vol_log->flush(vol_log))) {
@@ -4525,8 +4546,11 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	if (is_talkman_cpu()) {
+		print("== XNULOADER starting on Cortex-A53/A57 (Lumia 950?) ==\n");
+	}
 	vol_log_open();
-	if (vol_log != NULL) {
+	if (vol_log != NULL || is_talkman_cpu()) {
 		/*
 		 * Asked to log on this volume: first a mark anyone can see that this loader runs at all, a blue band over
 		 * the top of the firmware's framebuffer, then the first checkpoint, before anything this port has to guess.
@@ -4545,6 +4569,9 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("== XNULOADER: log on this volume ==\n");
 		print("MIDR=%x talkman cores: %s\n", READ_SYSREG(MIDR_EL1), is_talkman_cpu() ? "yes" : "no");
 		vol_log_save("first");
+		if (is_talkman_cpu()) {
+			BS->stall(10 * 1000000);        /* 15 s in all on the first screen */
+		}
 	}
 	int talkman = is_talkman_cpu();
 
