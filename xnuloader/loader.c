@@ -15,7 +15,15 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
-#define PAYLOAD_BASE        0xF0000000ULL
+/*
+ * Where the payload is: 0xF0000000 wherever the boot shim or QEMU put it there. A phone whose RAM ends below it
+ * (the Lumia 950: 3 GiB from 0) has nothing at that address, so efi_main sets this to 0 there, and the payload from
+ * the volume goes wherever the firmware gives 64 MiB (load_payload_from_volume). The kernel learns the panic log's
+ * place from the device tree, not from this.
+ */
+#define PAYLOAD_BASE_FIXED  0xF0000000ULL
+static uint64_t payload_base = PAYLOAD_BASE_FIXED;
+#define PAYLOAD_BASE        payload_base
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -553,7 +561,9 @@ dt_end(struct dt_writer *w)
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
-	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_dist, gic_redist;   /* GICv3; with gic_v2, gic_redist is the GICv2 CPU interface (GICC) */
+	int gic_v2;                      /* a GICv2 (no ICC_* system registers): its CPU interface is memory-mapped */
+	const uint32_t *core_mpidr;      /* MPIDR of core n, where the cores are not numbered by core_shift alone */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -587,6 +597,41 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 };
+
+/*
+ * Microsoft Lumia 950 (RM-1104, "talkman"), Snapdragon 808 (MSM8992), started from its own UEFI
+ * (Lumia950XLPkg, chainloaded from Windows Phone's boot manager), which loads \EFI\BOOT\BOOTAA64.EFI
+ * and the payload from a FAT volume. Its QGIC2 is a GICv2: distributor at 0xF9000000, CPU interface
+ * at 0xF9002000. PSCI is reached with HVC and starts the cores one at a time (UniXNU's 950 XL port).
+ * Four Cortex-A53s in cluster 0 and two Cortex-A57s in cluster 1: MPIDR 0..3, 0x100, 0x101. DRAM is
+ * the 3 GiB from 0, so the payload cannot be at 0xF0000000 (see payload_base).
+ */
+static const uint32_t talkman_core_mpidr[] = { 0x000, 0x001, 0x002, 0x003, 0x100, 0x101 };
+
+static const struct platform platform_talkman = {
+	.name = "talkman", .io_base = 0xF8000000, .io_size = 0x08000000,
+	.gic_dist = 0xF9000000, .gic_redist = 0xF9002000, .gic_v2 = 1, .uart = 0, .psci_hvc = 1, .log_other_cpu = 0,
+	.cores = 6, .core_mpidr = talkman_core_mpidr,
+	.small_cores = 0x0f,
+};
+
+/* The MPIDR of a platform's core n, and back: -1 for an MPIDR that is none of its cores. */
+static uint64_t
+plat_core_mpidr(const struct platform *plat, int core)
+{
+	return plat->core_mpidr != NULL ? plat->core_mpidr[core] : (uint64_t)core << plat->core_shift;
+}
+
+static int
+plat_core_index(const struct platform *plat, uint64_t mpidr)
+{
+	for (int core = 0; core < plat->cores; core++) {
+		if (plat_core_mpidr(plat, core) == (mpidr & 0xFFFFFF)) {
+			return core;
+		}
+	}
+	return -1;
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -622,7 +667,26 @@ enum {
 	CTX_TPIDR_EL1, CTX_TPIDR_EL0, CTX_TPIDRRO_EL0, CTX_SP_EL0, CTX_CONTEXTIDR, CTX_MDSCR, CTX_FPCR, CTX_FPSR,
 	CTX_ICC_PMR, CTX_ICC_IGRPEN1, CTX_ICC_BPR1, CTX_COUNT
 };
+/*
+ * Clear PSTATE.PAN and PSTATE.UAO where the processor has them. They are ARMv8.1 and ARMv8.2: on an
+ * ARMv8.0 core (the Lumia 950's Cortex-A53 and A57) the MSR is an undefined instruction, so it is
+ * left out when ID_AA64MMFR1_EL1.PAN or ID_AA64MMFR2_EL1.UAO (RAZ on ARMv8.0) says there is none.
+ */
+#define PSTATE_PAN_UAO_OFF(reg) \
+        "  mrs " reg ", id_aa64mmfr1_el1\n" \
+        "  ubfx " reg ", " reg ", #20, #4\n" \
+        "  cbz " reg ", 5f\n" \
+        "  .inst 0xd500409f\n"          /* msr PAN, #0 */ \
+        "5:\n" \
+        "  mrs " reg ", s3_0_c0_c7_2\n"  /* ID_AA64MMFR2_EL1 */ \
+        "  ubfx " reg ", " reg ", #4, #4\n" \
+        "  cbz " reg ", 6f\n" \
+        "  .inst 0xd500407f\n"          /* msr UAO, #0 */ \
+        "6:\n"
+
 uint64_t loader_ctx[CTX_COUNT];
+/* 0 on a GICv2 platform: there are no ICC_* system registers to save and put back (they would trap) */
+uint32_t loader_gic_v3 = 1;
 int loader_save_ctx(void);
 void loader_return_stub(void);
 
@@ -655,9 +719,13 @@ __asm__ (
         "  mrs x9, s3_3_c4_c4_0\n          str x9, [x10, #328]\n"
         "  mrs x9, s3_3_c4_c4_1\n          str x9, [x10, #336]\n"
         /* GICv3 CPU interface: the kernel reprograms it for its own interrupts */
+        "  adrp x11, loader_gic_v3\n"
+        "  ldr w11, [x11, :lo12:loader_gic_v3]\n"
+        "  cbz w11, 3f\n"
         "  mrs x9, icc_pmr_el1\n     str x9, [x10, #344]\n"
         "  mrs x9, icc_igrpen1_el1\n str x9, [x10, #352]\n"
         "  mrs x9, icc_bpr1_el1\n    str x9, [x10, #360]\n"
+        "3:\n"
         "  mrs x9, spsel\n"
         "  cbz x9, 1f\n"                  /* SP_EL0 is only accessible while running on SP_EL1 */
         "  mrs x9, sp_el0\n        str x9, [x10, #304]\n"
@@ -678,8 +746,7 @@ __asm__ (
         /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
          * UEFI maps its memory as EL0-accessible, so with PAN every data access
          * (including the exception handler's own stack push) faults. */
-        "  .inst 0xd500409f\n"          /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"          /* msr UAO, #0 */
+        PSTATE_PAN_UAO_OFF("x9")
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -714,9 +781,13 @@ __asm__ (
         "  ldr x9, [x10, #296]\n msr tpidrro_el0, x9\n"
         "  ldr x9, [x10, #312]\n msr contextidr_el1, x9\n"
         "  ldr x9, [x10, #320]\n msr mdscr_el1, x9\n"
+        "  adrp x11, loader_gic_v3\n"
+        "  ldr w11, [x11, :lo12:loader_gic_v3]\n"
+        "  cbz w11, 3f\n"
         "  ldr x9, [x10, #344]\n msr icc_pmr_el1, x9\n"
         "  ldr x9, [x10, #360]\n msr icc_bpr1_el1, x9\n"
         "  ldr x9, [x10, #352]\n msr icc_igrpen1_el1, x9\n"
+        "3:\n"
         "  ldr x9, [x10, #328]\n msr s3_3_c4_c4_0, x9\n"
         "  ldr x9, [x10, #336]\n msr s3_3_c4_c4_1, x9\n"
         "  ldr x9, [x10, #104]\n msr cntkctl_el1, x9\n"
@@ -850,8 +921,7 @@ __asm__ (
         ".globl other_cpu_return_stub\n"
         "other_cpu_return_stub:\n"              /* x0..x7 as for loader_return_stub */
         "  msr daifset, #0xf\n"
-        "  .inst 0xd500409f\n"                  /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"                  /* msr UAO, #0 */
+        PSTATE_PAN_UAO_OFF("x9")
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -2371,8 +2441,15 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
 			__asm__ volatile ("msr daifset, #0xf");
-			group1 = READ_SYSREG(S3_0_C12_C12_7);          /* ICC_IGRPEN1_EL1 */
-			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
+			if (PLAT->gic_v2) {
+				/* GICC_CTLR: this core's CPU interface stops signalling, the same as group 1 off on a GICv3 */
+				group1 = *(volatile uint32_t *)(uintptr_t)PLAT->gic_redist;
+				*(volatile uint32_t *)(uintptr_t)PLAT->gic_redist = 0;
+				__asm__ volatile ("dsb sy\nisb");
+			} else {
+				group1 = READ_SYSREG(S3_0_C12_C12_7);  /* ICC_IGRPEN1_EL1 */
+				__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
+			}
 		}
 		/* both are written by a core with its caches off: look at memory, not at our copy */
 		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
@@ -2436,7 +2513,12 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	run_active = 0;
 
 	if (watching_only) {
-		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+		if (PLAT->gic_v2) {
+			*(volatile uint32_t *)(uintptr_t)PLAT->gic_redist = (uint32_t)group1;
+			__asm__ volatile ("dsb sy\nisb");
+		} else {
+			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
+		}
 		__asm__ volatile ("msr daif, %0" : : "r" (daif));
 	}
 	return status;
@@ -2599,6 +2681,10 @@ parse_payload(struct payload_info *pi, int verbose)
 
 	memset(pi, 0, sizeof(*pi));
 	pi->cmdline = "";
+	if (PAYLOAD_BASE == 0) {
+		print("no payload (no RAM at %x, and none from the volume)\n", PAYLOAD_BASE_FIXED);
+		return 0;
+	}
 	if (ph->magic != PAYLOAD_MAGIC) {
 		print("no payload at %x (magic %x)\n", PAYLOAD_BASE, (uint64_t)ph->magic);
 		return 0;
@@ -3014,7 +3100,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_enabled = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+			if (c[8] - '0' < PLAT->cores) {
+				kernel_mpidr = plat_core_mpidr(PLAT, c[8] - '0');
+			}
 		}
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
@@ -3361,16 +3449,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
 	 */
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
-	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+	int cpu_count = 1, boot_core = plat_core_index(plat, kernel_mpidr);
 
 	if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
-				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				uint64_t mpidr;
 				int64_t state;
 
-				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
+				if (core < 0 || core >= plat->cores || (mpidr = plat_core_mpidr(plat, core)) == this_mpidr) {
 					continue;
 				}
 				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
@@ -3403,7 +3491,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+		int core = plat_core_index(plat, cpu_mpidr[i]);
+
+		if (core >= 0 && (plat->small_cores & (1u << (core & 31)))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -3427,8 +3517,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
-	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+	/* GICv3: distributor and redistributors; GICv2: distributor and CPU interface (GICC) */
+	dt_prop_str(&w, "compatible", plat->gic_v2 ? "arm,gic-400" : "arm,gic-v3");
+	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, plat->gic_v2 ? 0x1000 : 0x10000,
+		plat->gic_redist - plat->io_base, plat->gic_v2 ? 0x2000 : 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
 	dt_end(&w);
 	if (plat->uart != 0) {
@@ -4178,6 +4270,32 @@ ramfb_phone_screen(void)
  * Only the kernel and a root image that fits in the payload come this way; the big Darwin system image does not
  * (docs/uefi-boot.md says what does).
  */
+/*
+ * Whether the firmware's memory map has RAM (of any type but reserved or memory-mapped I/O) at every page of
+ * [base, base + size). Descriptors are taken one after another as the map lists them, which UEFI sorts by address.
+ */
+static int
+ram_covers(uint64_t base, uint64_t size)
+{
+	static uint8_t map_buf[65536];
+	uint64_t map_size = sizeof(map_buf), map_key, desc_size, need = base;
+	uint32_t desc_ver;
+
+	if (EFI_ERROR(BS->get_memory_map(&map_size, map_buf, &map_key, &desc_size, &desc_ver))) {
+		return 1;                       /* not known: as before this check existed */
+	}
+	for (uint64_t off = 0; off < map_size && need < base + size; off += desc_size) {
+		const efi_memory_descriptor *d = (const efi_memory_descriptor *)(map_buf + off);
+		uint64_t end = d->phys_start + (d->pages << 12);
+
+		/* 0 reserved, 11 and 12 memory-mapped I/O: not RAM to put a payload in */
+		if (d->type != 0 && d->type != 11 && d->type != 12 && d->phys_start <= need && end > need) {
+			need = end;
+		}
+	}
+	return need >= base + size;
+}
+
 static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
 static const char *volume_payload_note;         /* why not, if it was looked for */
 
@@ -4223,7 +4341,18 @@ load_payload_from_volume(void)
 	 * memory the firmware has not given to us must not be written.
 	 */
 	pages = PAYLOAD_MAX_SIZE / 0x1000;
-	if (EFI_ERROR(BS->allocate_pages(2 /* AllocateAddress */, 2 /* EfiLoaderData */, pages, &address))) {
+	if (address == 0) {
+		/*
+		 * No RAM at the fixed address: 64 MiB below 3 GiB, wherever the firmware has them (UEFI gives the highest
+		 * free pages under the limit, so the start of RAM, where the kernel's window goes, is left alone).
+		 */
+		address = 0xC0000000ULL - 1;
+		if (EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 2 /* EfiLoaderData */, pages, &address))) {
+			volume_payload_note = "there are no 64 MiB of free RAM below 3 GiB for the payload";
+			goto close;
+		}
+		payload_base = address;
+	} else if (EFI_ERROR(BS->allocate_pages(2 /* AllocateAddress */, 2 /* EfiLoaderData */, pages, &address))) {
 		volume_payload_note = "the payload region is not free (the firmware keeps it reserved)";
 		goto close;
 	}
@@ -4262,7 +4391,7 @@ payload_kernel_version(void)
 {
 	const struct payload_header *ph = (const struct payload_header *)PAYLOAD_BASE;
 
-	if (ph->magic != PAYLOAD_MAGIC) {
+	if (PAYLOAD_BASE == 0 || ph->magic != PAYLOAD_MAGIC) {
 		return NULL;
 	}
 	/* (the same limits as parse_payload: a header size or an entry size that reaches past the payload ends the walk) */
@@ -4319,8 +4448,16 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	/*
+	 * RAM that ends below the fixed payload address (the Lumia 950): reading it would fault, so there is no payload
+	 * there. Asked only of a processor without the GICv3 system registers (ID_AA64PFR0_EL1.GIC 0), so the GICv3
+	 * phones, whose shim leaves the payload in memory the firmware's map may call reserved, are as they were.
+	 */
+	if (((READ_SYSREG(ID_AA64PFR0_EL1) >> 24) & 0xf) == 0 && !ram_covers(PAYLOAD_BASE_FIXED, PAYLOAD_MAX_SIZE)) {
+		payload_base = 0;
+	}
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
-	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
+	if (PAYLOAD_BASE == 0 || ((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
 	}
 	print("== XNULOADER v3 ==\n");
@@ -4345,12 +4482,18 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == 0x00400000ULL && ((READ_SYSREG(ID_AA64PFR0_EL1) >> 24) & 0xf) == 0) {
+			/* Lumia950XLPkg's framebuffer, on a core with no GICv3 system registers: the Lumia 950 */
+			PLAT = &platform_talkman;
 		} else {
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	/* read by loader_return_stub, part of it with the caches off: the value must be in memory */
+	loader_gic_v3 = !PLAT->gic_v2;
+	clean_dcache((uint64_t)(uintptr_t)&loader_gic_v3, (uint64_t)(uintptr_t)&loader_gic_v3 + sizeof(loader_gic_v3));
 
 	install_exception_hook();
 	wdt_arm();
