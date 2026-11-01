@@ -2601,6 +2601,7 @@ wdt_arm(void)
 /* UEFI exception hook: put the fault into the log instead of on the screen  */
 
 extern char __ImageBase;
+static void vol_log_save(const char *checkpoint);
 
 static void EFIAPI
 exception_handler(int64_t type, uint64_t *ctx)
@@ -2611,7 +2612,8 @@ exception_handler(int64_t type, uint64_t *ctx)
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
 	flush_log();
 	if (PLAT == &platform_talkman) {
-		/* no log partition on this phone: the screen is the only record, so it stays up for a minute */
+		/* no log partition on this phone: the log file (if UEFI's file system still answers) and the screen */
+		vol_log_save("UEFI exception");
 		uint64_t start = READ_SYSREG(CNTVCT_EL0);
 
 		while (READ_SYSREG(CNTVCT_EL0) - start < 60 * READ_SYSREG(CNTFRQ_EL0)) {
@@ -4303,6 +4305,72 @@ ram_covers(uint64_t base, uint64_t size)
 	return need >= base + size;
 }
 
+/*
+ * The Lumia 950 by its processor: Cortex-A53 (0xD03) or Cortex-A57 (0xD07), which no other platform of this loader
+ * has (redwood: A55/A78; QEMU: -cpu cortex-a76). Known before anything is drawn or read, unlike the framebuffer.
+ */
+static int
+is_talkman_cpu(void)
+{
+	uint64_t midr = READ_SYSREG(MIDR_EL1), part = (midr >> 4) & 0xfff;
+
+	return ((midr >> 24) & 0xff) == 0x41 && (part == 0xD03 || part == 0xD07);
+}
+
+/*
+ * A log file on the loader's own volume, for the phone with no logdump partition (the Lumia 950):
+ * \EFI\hakios\loader.log, made anew at each start and written whole, flushed, at every checkpoint, so that a
+ * reset leaves the last checkpoint reached on the volume. Only on that phone; nothing else is written there.
+ */
+static efi_file *vol_log;
+
+static void
+vol_log_open(void)
+{
+	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID;
+	static const char16 dir_path[] = u"\\EFI\\hakios", path[] = u"\\EFI\\hakios\\loader.log";
+	efi_loaded_image *image = NULL;
+	efi_simple_fs *fs = NULL;
+	efi_file *root = NULL, *dir = NULL, *file = NULL;
+
+	if (EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
+	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL ||
+	    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+		return;
+	}
+	if (!EFI_ERROR(root->open(root, &dir, dir_path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+	    EFI_FILE_DIRECTORY)) && dir != NULL) {
+		dir->close(dir);
+	}
+	/* an old log goes first: a shorter new one written over it would keep the old one's tail */
+	if (!EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && file != NULL) {
+		file->remove(file);
+		file = NULL;
+	}
+	if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+		file = NULL;
+	}
+	root->close(root);
+	vol_log = file;
+}
+
+static void
+vol_log_save(const char *checkpoint)
+{
+	uint64_t size;
+
+	if (vol_log == NULL) {
+		return;
+	}
+	print("[checkpoint %s]\n", checkpoint);
+	size = log_len;
+	if (EFI_ERROR(vol_log->set_position(vol_log, 0)) || EFI_ERROR(vol_log->write(vol_log, &size, log_buf)) ||
+	    EFI_ERROR(vol_log->flush(vol_log))) {
+		print("log: \\EFI\\hakios\\loader.log could not be written; no more tries\n");
+		vol_log = NULL;
+	}
+}
+
 static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
 static const char *volume_payload_note;         /* why not, if it was looked for */
 
@@ -4455,17 +4523,37 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	int talkman = is_talkman_cpu();
+
+	if (talkman) {
+		vol_log_open();
+		print("== XNULOADER (talkman bring-up) ==\n");
+		print("firmware: %d.%d, revision %x; MIDR=%x PFR0=%x MMFR1=%x CurrentEL=%x\n",
+		    (uint64_t)(ST->hdr.revision >> 16), (uint64_t)(ST->hdr.revision & 0xffff), (uint64_t)ST->revision,
+		    READ_SYSREG(MIDR_EL1), READ_SYSREG(ID_AA64PFR0_EL1), READ_SYSREG(ID_AA64MMFR1_EL1),
+		    READ_SYSREG(CurrentEL) >> 2);
+		print("firmware vendor: ");
+		for (const char16 *v = ST->vendor; v != NULL && *v != 0; v++) {
+			put_char(*v < 0x80 ? (char)*v : '?');
+		}
+		print("\n");
+		vol_log_save("started");
+	}
 	/*
 	 * RAM that ends below the fixed payload address (the Lumia 950): reading it would fault, so there is no payload
-	 * there. Asked only of a processor without the GICv3 system registers (ID_AA64PFR0_EL1.GIC 0), so the GICv3
-	 * phones, whose shim leaves the payload in memory the firmware's map may call reserved, are as they were.
+	 * there. Asked only on that phone, so the others, whose shim leaves the payload in memory the firmware's map may
+	 * call reserved, are as they were.
 	 */
-	if (((READ_SYSREG(ID_AA64PFR0_EL1) >> 24) & 0xf) == 0 && !ram_covers(PAYLOAD_BASE_FIXED, PAYLOAD_MAX_SIZE)) {
+	if (talkman && !ram_covers(PAYLOAD_BASE_FIXED, PAYLOAD_MAX_SIZE)) {
 		payload_base = 0;
+		print("no RAM at %x: the payload can only come from the volume\n", PAYLOAD_BASE_FIXED);
 	}
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
 	if (PAYLOAD_BASE == 0 || ((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
+	}
+	if (talkman) {
+		vol_log_save("payload looked for");
 	}
 	print("== XNULOADER v3 ==\n");
 	print_banner();
@@ -4478,7 +4566,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
-	PLAT = &platform_qemu_virt;
+	PLAT = talkman ? &platform_talkman : &platform_qemu_virt;
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -4487,11 +4575,12 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		if (SCREEN.base == 0xE1000000ULL) {
+		if (talkman) {
+			/* the Lumia 950 keeps the framebuffer UEFI gave (never QEMU's fw_cfg: that address is RAM there) */
+			print("display: GOP pixel format %d, %d pixels a line\n", (uint64_t)GOP->mode->info->pixel_format,
+			    (uint64_t)GOP->mode->info->pixels_per_scanline);
+		} else if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
-		} else if (SCREEN.base == 0x00400000ULL && ((READ_SYSREG(ID_AA64PFR0_EL1) >> 24) & 0xf) == 0) {
-			/* Lumia950XLPkg's framebuffer, on a core with no GICv3 system registers: the Lumia 950 */
-			PLAT = &platform_talkman;
 		} else {
 			ramfb_phone_screen();
 		}
@@ -4502,10 +4591,17 @@ efi_main(efi_handle image, efi_system_table *st)
 	loader_gic_v3 = !PLAT->gic_v2;
 	clean_dcache((uint64_t)(uintptr_t)&loader_gic_v3, (uint64_t)(uintptr_t)&loader_gic_v3 + sizeof(loader_gic_v3));
 
+	if (talkman) {
+		vol_log_save("platform chosen");
+	}
+
 	install_exception_hook();
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
+	if (talkman) {
+		vol_log_save(have_payload ? "payload parsed, starting the kernel" : "no payload");
+	}
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();
@@ -4523,6 +4619,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		 */
 		print_memory_map();
 		print("nothing to boot: back to the firmware in 60 s\n");
+		vol_log_save("memory map");
 		BS->stall(60 * 1000000);
 		return 0x800000000000000EULL;   /* EFI_NOT_FOUND */
 	}

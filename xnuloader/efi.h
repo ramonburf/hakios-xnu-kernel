@@ -190,11 +190,14 @@ typedef struct efi_file {
 	uint64_t revision;
 	efi_status (EFIAPI *open)(struct efi_file *self, struct efi_file **file, const char16 *name, uint64_t mode, uint64_t attributes);
 	efi_status (EFIAPI *close)(struct efi_file *self);
-	void *remove;
+	efi_status (EFIAPI *remove)(struct efi_file *self);
 	efi_status (EFIAPI *read)(struct efi_file *self, uint64_t *size, void *buffer);
-	void *write, *get_position, *set_position;
+	efi_status (EFIAPI *write)(struct efi_file *self, uint64_t *size, const void *buffer);
+	void *get_position;
+	efi_status (EFIAPI *set_position)(struct efi_file *self, uint64_t position);
 	efi_status (EFIAPI *get_info)(struct efi_file *self, const efi_guid *type, uint64_t *size, void *buffer);
-	void *set_info, *flush;
+	void *set_info;
+	efi_status (EFIAPI *flush)(struct efi_file *self);
 } efi_file;
 
 typedef struct efi_simple_fs {
@@ -203,6 +206,9 @@ typedef struct efi_simple_fs {
 } efi_simple_fs;
 
 #define EFI_FILE_MODE_READ      1ULL
+#define EFI_FILE_MODE_WRITE     2ULL
+#define EFI_FILE_MODE_CREATE    0x8000000000000000ULL
+#define EFI_FILE_DIRECTORY      0x10ULL
 /* EFI_FILE_INFO: a size, then the file's size at offset 8 (the rest -- times, attributes, the name -- is not read) */
 #define EFI_FILE_INFO_FILE_SIZE_OFFSET 8
 
