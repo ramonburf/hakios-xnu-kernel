@@ -98,7 +98,7 @@ static efi_system_table *ST;
 static efi_boot_services *BS;
 static efi_handle IMAGE;
 
-static char log_buf[32768];
+static char log_buf[131072];        /* (32 KB filled 310 s into a run on the Lumia 950: its notes every 10 s) */
 static uint32_t log_len;
 
 void *
@@ -2440,7 +2440,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
 	uint64_t talkman_noted = 0;
-	uint32_t talkman_klog_len = 0;
+	uint32_t talkman_klog_len = 0, talkman_klog_at = 0;
 	talkman_run_started = started;
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
 	if (PLAT->log_other_cpu) {
@@ -2526,12 +2526,19 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				/* the whole log so far, whenever it has grown, as \EFI\hakios\kernel.log (log_poc=1 makes it readable) */
 				flush_dcache(live->log_len + slide, live->log_len + slide + 4);
 				uint32_t klen = *(volatile uint32_t *)(live->log_len + slide);
-				if (klen != talkman_klog_len && klen <= live->log_head) {
+				/*
+				 * Past its first 256 KB the log is a ring that the kernel puts in order only when it returns; the
+				 * drivers' lines are all in it (init's console fills the head first). So once a minute the whole
+				 * buffer as it is, head and ring, the ring's oldest part maybe after its newest.
+				 */
+				if ((klen != talkman_klog_len && klen <= live->log_head) ||
+				    (klen > live->log_head && talkman_noted >= talkman_klog_at + 60)) {
 					const char *klog = (const char *)(live->log + slide);
 
 					flush_dcache((uint64_t)(uintptr_t)klog, (uint64_t)(uintptr_t)klog + klen);
 					vol_write_kernel_log(klog, klen);
 					talkman_klog_len = klen;
+					talkman_klog_at = talkman_noted;
 				}
 			}
 			vol_log_note();
