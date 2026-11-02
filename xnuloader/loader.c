@@ -4511,6 +4511,167 @@ gpu_branch_on(uint32_t offset, const char *name)
 	return 0;
 }
 
+/*
+ * RPM over SMD, polled, from this loader: the firmware's SmdRpmDxe opens the APPS-RPM channel at its start and, as
+ * this build does not install its RPM protocol, closes it again at once. The channel is in RPM's message RAM where
+ * the 950 XL port measured it (UniXNU docs/hardware/2026-10-26-smem-preflight-v3.json: channel 4, its two 44-byte
+ * stream states at 0xfc428000, 2 x 1024 bytes of FIFO at 0xfc428200); the protocol is the firmware's own smd.c and
+ * rpm-smd.c (Lumia950XLPkg, from LK). The doorbell is APCS's IPC register, bit 0.
+ */
+#define RPM_SMD_CTRL            0xfc428000ULL
+#define RPM_SMD_FIFO            0xfc428200ULL
+#define RPM_SMD_FIFO_SIZE       1024u
+#define RPM_IPC                 0xf900d008ULL
+
+struct smd_stream {
+	uint32_t state, dtr, cts, cd, ri, data_written, data_read, state_updated, mask_recv_intr, read_index, write_index;
+};
+#define SMD_LOCAL               ((volatile struct smd_stream *)RPM_SMD_CTRL)
+#define SMD_REMOTE              ((volatile struct smd_stream *)(RPM_SMD_CTRL + sizeof(struct smd_stream)))
+
+static void
+rpm_notify(void)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)RPM_IPC = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+smd_local_state(uint32_t state)
+{
+	uint32_t on = state == 2;
+
+	SMD_LOCAL->dtr = on;
+	SMD_LOCAL->cts = on;
+	SMD_LOCAL->cd = on;
+	SMD_LOCAL->state = state;
+	SMD_LOCAL->state_updated = 1;
+	rpm_notify();
+}
+
+static void
+smd_show(const char *when)
+{
+	print("rpm: %s: local state %d dtr %d w %x r %x, remote state %d dsr %d w %x r %x\n", when, (uint64_t)SMD_LOCAL->state,
+	    (uint64_t)SMD_LOCAL->dtr, (uint64_t)SMD_LOCAL->write_index, (uint64_t)SMD_LOCAL->read_index,
+	    (uint64_t)SMD_REMOTE->state, (uint64_t)SMD_REMOTE->dtr, (uint64_t)SMD_REMOTE->write_index,
+	    (uint64_t)SMD_REMOTE->read_index);
+}
+
+/* Open the channel: OPENING, then OPENED once RPM is; 2 s at most. */
+static int
+rpm_open(void)
+{
+	if (!va_mapped(RPM_SMD_CTRL) || !va_mapped(RPM_SMD_FIFO) || !va_mapped(RPM_IPC & ~0xfffULL)) {
+		print("rpm: its message RAM or doorbell is not mapped by the firmware\n");
+		return 0;
+	}
+	smd_show("as found");
+	if (SMD_LOCAL->state > 6 || SMD_REMOTE->state > 6 || SMD_LOCAL->write_index >= RPM_SMD_FIFO_SIZE ||
+	    SMD_REMOTE->write_index >= RPM_SMD_FIFO_SIZE || (SMD_LOCAL->write_index & 3)) {
+		print("rpm: that is not an SMD channel: left alone\n");
+		return 0;
+	}
+	if (SMD_LOCAL->state == 2 && (SMD_REMOTE->state == 2 || SMD_REMOTE->state == 3)) {
+		return 1;
+	}
+	if (SMD_LOCAL->state == 0 || SMD_LOCAL->state == 4) {
+		SMD_REMOTE->read_index = 0;
+		SMD_LOCAL->write_index = 0;
+		SMD_LOCAL->mask_recv_intr = 0;
+		smd_local_state(1);
+	}
+	for (int i = 0; i < 20000; i++) {
+		uint32_t remote = SMD_REMOTE->state;
+
+		if (SMD_REMOTE->state_updated) {
+			SMD_REMOTE->state_updated = 0;
+		}
+		if (SMD_LOCAL->state == 1 && remote == 2) {
+			smd_local_state(2);
+		}
+		if (SMD_LOCAL->state == 2 && (remote == 2 || remote == 3)) {
+			smd_show("open");
+			return 1;
+		}
+		BS->stall(100);
+	}
+	smd_show("did not open");
+	return 0;
+}
+
+static void
+fifo_put(const uint32_t *words, uint32_t bytes)
+{
+	uint32_t w = SMD_LOCAL->write_index;
+
+	for (uint32_t i = 0; i < bytes / 4; i++) {
+		*(volatile uint32_t *)(RPM_SMD_FIFO + w) = words[i];
+		w = (w + 4) % RPM_SMD_FIFO_SIZE;
+	}
+	SMD_LOCAL->write_index = w;
+}
+
+static void
+fifo_get(uint32_t *words, uint32_t bytes)
+{
+	uint32_t r = SMD_REMOTE->read_index;
+
+	for (uint32_t i = 0; i < bytes / 4; i++) {
+		words[i] = *(volatile uint32_t *)(RPM_SMD_FIFO + RPM_SMD_FIFO_SIZE + r);
+		r = (r + 4) % RPM_SMD_FIFO_SIZE;
+	}
+	SMD_REMOTE->read_index = r;
+}
+
+static uint32_t
+fifo_waiting(void)
+{
+	return (SMD_REMOTE->write_index - SMD_REMOTE->read_index + RPM_SMD_FIFO_SIZE) % RPM_SMD_FIFO_SIZE;
+}
+
+/* One active-set request of one 4-byte value; 0 if RPM acknowledged it without an error. */
+static int
+rpm_request(uint32_t type, uint32_t id, uint32_t key, uint32_t value)
+{
+	static uint32_t msg_id;
+	uint32_t pkt[5] = { 40, 0, 0, 0, 0 };   /* smd_pkt_hdr: the size of what follows */
+	uint32_t msg[10] = { 0x00716572 /* "req" */, 20 + 12, ++msg_id, 0 /* active set */, type, id, 12, key, 4, value };
+	uint32_t ack[16] = { 0 };
+
+	SMD_REMOTE->data_read = 0;
+	fifo_put(pkt, sizeof(pkt));
+	fifo_put(msg, sizeof(msg));
+	SMD_LOCAL->data_written = 1;
+	SMD_LOCAL->mask_recv_intr = 0;
+	rpm_notify();
+	for (int i = 0; i < 20000 && fifo_waiting() < sizeof(pkt); i++) {
+		BS->stall(100);
+	}
+	if (fifo_waiting() < sizeof(pkt)) {
+		smd_show("no answer");
+		return -1;
+	}
+	fifo_get(pkt, sizeof(pkt));
+	for (int i = 0; i < 2000 && fifo_waiting() < pkt[0]; i++) {
+		BS->stall(100);
+	}
+	if (pkt[0] == 0 || pkt[0] > sizeof(ack) || (pkt[0] & 3) || fifo_waiting() < pkt[0]) {
+		print("rpm: a bad answer of %d bytes (%d there)\n", (uint64_t)pkt[0], (uint64_t)fifo_waiting());
+		return -1;
+	}
+	fifo_get(ack, pkt[0]);
+	SMD_REMOTE->data_written = 0;
+	SMD_LOCAL->data_read = 1;
+	SMD_LOCAL->mask_recv_intr = 1;
+	rpm_notify();
+	print("rpm: answer %d bytes: %x %x %x %x %x %x %x\n", (uint64_t)pkt[0], (uint64_t)ack[0], (uint64_t)ack[1],
+	    (uint64_t)ack[2], (uint64_t)ack[3], (uint64_t)ack[4], (uint64_t)ack[5], (uint64_t)ack[6]);
+	/* the ack is "req", then key "msg" with our id; an error adds an "err" key (Linux rpm-smd.c) */
+	return ack[0] == 0x00716572 && ack[1] == 0x0c ? 0 : -1;
+}
+
 static void
 talkman_gpu_probe(int level)
 {
@@ -4536,6 +4697,20 @@ talkman_gpu_probe(int level)
 		print("gpu: asking RPM for the graphics clock (clk2 #1, 300000 KHz)\n");
 		vol_log_note();
 		print("gpu: RPM answers %d\n", (uint64_t)rpm->rpm_send_data(vote, 12, 0 /* RPM_REQUEST_TYPE */));
+	} else {
+		print("rpm: opening the APPS-RPM channel ourselves\n");
+		vol_log_note();
+		if (!rpm_open()) {
+			return;
+		}
+		print("gpu: asking RPM for the graphics clock (clk2 #1, 300000 KHz)\n");
+		vol_log_note();
+		if (rpm_request(0x326b6c63, 1, 0x007a484b, 300000) != 0) {
+			print("gpu: RPM did not acknowledge the graphics clock: the GPU stays off\n");
+			return;
+		}
+		print("gpu: RPM acknowledged the graphics clock\n");
+		BS->stall(1000);
 	}
 	print("gpu: powering the CX and GX domains\n");
 	vol_log_note();
