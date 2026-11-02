@@ -18,6 +18,8 @@ on:
       - 'configs/**'
       - 'devices/talkman/**'
       - '.github/workflows/kernel-talkman.yml'
+      - 'userland/src/init.c'
+      - 'userland/libmini/**'
 
 permissions:
   contents: read
@@ -70,6 +72,31 @@ jobs:
           file hakios-kernel
           strings hakios-kernel | grep -m3 -i "gic" || true
           shasum -a 256 hakios-kernel
+
+      # init and its two helpers, as userland/build.sh compiles them: prebuilt/userland's are from 25 October and know
+      # nothing of the data volume (var_hfs=), so the 950's /private/var stayed a memory filesystem
+      - name: init, child, stage0 (static, userland/src)
+        run: |
+          source xnu-env.sh
+          cd userland
+          mkdir -p obj
+          CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
+          LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
+          $CC -Ilibmini -c libmini/mini.c -o obj/mini.o
+          $CC -c libmini/start.S -o obj/start.o
+          for prog in init child stage0; do
+            $CC -Ilibmini $LD -o obj/$prog src/$prog.c obj/mini.o obj/start.o
+          done
+          file obj/init obj/child obj/stage0
+          strings obj/init | grep -c var_hfs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakios-userland-static-talkman
+          path: |
+            userland/obj/init
+            userland/obj/child
+            userland/obj/stage0
 
       - uses: actions/upload-artifact@v4
         if: always()
