@@ -2882,6 +2882,7 @@ static struct {
 static void talkman_scanout_move(void);
 static void talkman_scanout_restore(void);
 static void talkman_gpu_probe(int level);
+static void talkman_wifi_probe(void);
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
@@ -3174,6 +3175,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int torch_requested = 0;
 	/* "gpu_probe=N" there too: the Lumia 950's GPU, bring-up (talkman_gpu_probe) */
 	int gpu_probe = 0;
+	/* "wifi_probe=1" there too: what the firmware left of the Lumia 950's PCIe and Wi-Fi (talkman_wifi_probe) */
+	int wifi_probe = 0;
 	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c) */
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
@@ -3198,6 +3201,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
+		wifi_probe |= starts_with(c, "wifi_probe=1") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "gpu_probe=") && (c == pi.cmdline || c[-1] == ' ') && c[10] >= '1' && c[10] <= '9') {
 			gpu_probe = c[10] - '0';
 		}
@@ -3532,6 +3536,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* Panic log region: RAM outside XNU's window (tail of the payload reservation). */
 	uint64_t pram_reg[2] = { PANIC_LOG_BASE, PANIC_LOG_SIZE };
+	if (wifi_probe && PLAT == &platform_talkman) {
+		vol_log_note();
+		talkman_wifi_probe();
+	}
 	if (gpu_probe && PLAT == &platform_talkman) {
 		talkman_gpu_probe(gpu_probe);
 	}
@@ -4736,6 +4744,78 @@ talkman_gpu_probe(int level)
 	print("gpu: RBBM_HW_VERSION %x, HW_CONFIGURATION %x, RBBM_STATUS %x\n", (uint64_t)*(volatile uint32_t *)GPU_BASE,
 	    (uint64_t)*(volatile uint32_t *)(GPU_BASE + (0x0002 << 2)), (uint64_t)*(volatile uint32_t *)(GPU_BASE + (0x0191 << 2)));
 	vol_log_note();
+}
+
+/*
+ * The Lumia 950's Wi-Fi, a Qualcomm QCA6174 behind PCIe root complex 0 (boot-arg wifi_probe=1, talkman only): read
+ * only, what the firmware left. Its PCIExpressConfiguratorDxe (Lumia950XLPkg) powers the chip (GPIO 113 WLAN_EN, 112
+ * bootstrap, 35 PERST#), the PHY and the link, and maps the endpoint's configuration space with the iATU; whether it
+ * ran here, and how far, is what this says. Addresses: the phone's device tree (qcom,pcie@fc520000: parf 0xfc520000,
+ * phy 0xfc526000, dm_core 0xff000000, elbi 0xff000f20, conf 0xff100000), clock offsets from the firmware's
+ * clock-gcc-msm8994.c. The controller is read only when its configuration clock runs, the endpoint only when the
+ * link is up and an iATU region is enabled (an access across a dead link can hang the bus).
+ */
+#define GCC_BASE                0xfc400000ULL
+#define TLMM_BASE               0xfd510000ULL
+#define PCIE_PARF               0xfc520000ULL
+#define PCIE_PHY                0xfc526000ULL
+#define PCIE_DBI                0xff000000ULL
+#define PCIE_CONF               0xff100000ULL
+
+static uint32_t
+rd32(uint64_t address)
+{
+	return *(volatile uint32_t *)address;
+}
+
+static void
+talkman_wifi_probe(void)
+{
+	static const unsigned pins[] = { 113, 112, 35, 36, 1, 50 };
+	uint32_t cfg_ahb, link, viewport, ctrl2;
+
+	if (!va_mapped(GCC_BASE + 0x1000) || !va_mapped(GCC_BASE + 0x1000 + 0xe00) || !va_mapped(TLMM_BASE + 0x1000)) {
+		print("wifi: the clock or pin controller is not mapped by the firmware\n");
+		return;
+	}
+	cfg_ahb = rd32(GCC_BASE + 0x1AD0);
+	print("wifi: PCIe0 clocks: gdsc %x slv_axi %x mstr_axi %x cfg_ahb %x aux %x pipe %x pipe_rcgr %x, phy ldo %x\n",
+	    (uint64_t)rd32(GCC_BASE + 0x1AC4), (uint64_t)rd32(GCC_BASE + 0x1AC8), (uint64_t)rd32(GCC_BASE + 0x1ACC),
+	    (uint64_t)cfg_ahb, (uint64_t)rd32(GCC_BASE + 0x1AD4), (uint64_t)rd32(GCC_BASE + 0x1AD8),
+	    (uint64_t)rd32(GCC_BASE + 0x1ADC), (uint64_t)rd32(GCC_BASE + 0x1E00));
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+		uint32_t cfg = rd32(TLMM_BASE + 0x1000 + 0x10 * pins[i]), io = rd32(TLMM_BASE + 0x1004 + 0x10 * pins[i]);
+
+		print("wifi: gpio %d: cfg %x (function %d, %s) in %d out %d\n", (uint64_t)pins[i], (uint64_t)cfg,
+		    (uint64_t)(cfg >> 2 & 15), (cfg & (1u << 9)) ? "output" : "input", (uint64_t)(io & 1), (uint64_t)(io >> 1 & 1));
+	}
+	if (cfg_ahb & (1u << 31)) {
+		print("wifi: the PCIe controller's configuration clock is off: the firmware did not bring PCIe up\n");
+		return;
+	}
+	if (!va_mapped(PCIE_PARF) || !va_mapped(PCIE_PHY) || !va_mapped(PCIE_DBI)) {
+		print("wifi: the PCIe controller's registers are not mapped by the firmware\n");
+		return;
+	}
+	print("wifi: PARF sys_ctrl %x pm_stts %x phy_ctrl %x ltssm %x; PHY pcs_status %x\n", (uint64_t)rd32(PCIE_PARF),
+	    (uint64_t)rd32(PCIE_PARF + 0x24), (uint64_t)rd32(PCIE_PARF + 0x40), (uint64_t)rd32(PCIE_PARF + 0x1b0),
+	    (uint64_t)rd32(PCIE_PHY + 0x728));
+	link = rd32(PCIE_DBI + 0xf28);
+	print("wifi: root complex id %x, command %x, link ctrl/status %x, elbi sys_stts %x (link %s)\n",
+	    (uint64_t)rd32(PCIE_DBI), (uint64_t)rd32(PCIE_DBI + 4), (uint64_t)rd32(PCIE_DBI + 0x80), (uint64_t)link,
+	    (link & 0x400) ? "UP" : "down");
+	viewport = rd32(PCIE_DBI + 0x900);
+	ctrl2 = rd32(PCIE_DBI + 0x908);
+	print("wifi: iATU viewport %x: ctrl1 %x ctrl2 %x base %x limit %x target %x\n", (uint64_t)viewport,
+	    (uint64_t)rd32(PCIE_DBI + 0x904), (uint64_t)ctrl2, (uint64_t)rd32(PCIE_DBI + 0x90c), (uint64_t)rd32(PCIE_DBI + 0x914),
+	    (uint64_t)rd32(PCIE_DBI + 0x918));
+	if (!(link & 0x400) || !(ctrl2 & 0x80000000u) || !va_mapped(PCIE_CONF)) {
+		print("wifi: the endpoint is not looked at (link down, no iATU region, or its window not mapped)\n");
+		return;
+	}
+	vol_log_note();
+	print("wifi: endpoint 01:00.0: id %x, status/command %x, class %x, BAR0 %x\n", (uint64_t)rd32(PCIE_CONF),
+	    (uint64_t)rd32(PCIE_CONF + 4), (uint64_t)rd32(PCIE_CONF + 8), (uint64_t)rd32(PCIE_CONF + 0x10));
 }
 
 /* The MDSS source pipes found fetching the firmware's framebuffer (bit n: talkman_mdss_probe's pipes[n]) */
