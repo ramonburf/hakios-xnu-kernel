@@ -184,6 +184,7 @@ MODEM_SIM_SWITCH_OFF	arg	modem_sim_switch_off	Cellular	k	hakios.mpss.c
 MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is there, then back to the loader if modem_return=1 says so
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
+PMI8994	arg	pmi8994	Audio and battery	k	hakios.pmi8994.c	
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	

@@ -42,6 +42,7 @@ audio    bsd/dev/hakios.guard.c
 
 power    bsd/dev/hakios.battery.c
 power    iokit/Kernel/hakios.battery.cpp
+power    bsd/dev/hakios.pmi8994.c
 power    bsd/dev/hakios.cpufreq.c
 
 wifi     bsd/dev/hakios.wifi.c

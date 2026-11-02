@@ -204,6 +204,7 @@ modem_wait	k
 modem_wda_off	k
 net_names	k
 net_trace	k
+pmi8994	k
 pmic	k
 pmic_list	k
 press_power	k

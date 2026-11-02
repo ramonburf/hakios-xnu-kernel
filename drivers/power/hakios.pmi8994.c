@@ -1,0 +1,142 @@
+/*
+ * The Lumia 950's battery and charger (talkman, MSM8992): the PMI8994's charger and fuel gauge, read over the SPMI
+ * arbiter and handed to the battery service Darwin reads (hakios_battery_report: drivers/power/hakios.battery.c and
+ * .cpp, the IOPMPowerSource powerd matches for the status bar and Settings > Battery). Only with boot-arg pmi8994=1:
+ * every address below belongs to this phone.
+ *
+ * Read only. The charging itself needs nothing from the kernel: the PMI8994 charges with the setup the firmware gave
+ * it (the 950 XL port saw a 1500 mA input limit, fast charge, then taper to full). What is read (PMI8994 is SPMI
+ * slave 2; the cityman kernel's qpnp-smbcharger.c and qpnp-fg.c, as the 950 XL port's NativeBattery reads them):
+ *   FG_SOC 0x4009            the fuel gauge's monotonic state of charge, 0..255
+ *   USB_CHGPTH RT_STS 0x1310 bit 2: something on the USB port gives power
+ *   CHGR_STS 0x100e          bits 2:1: 0 not charging, 1 pre-charge, 2 fast charge, 3 taper
+ *   USB_CHGPTH IL_CFG 0x13f2 the input current limit, for the log
+ * The arbiter (0xfc4c0000) is read through one command channel at 0xf800, the 950 XL port's; the kernel's other SPMI
+ * users take hakios_spmi_lock (drivers/core/hakios.platform.c) for the same arbiter. Polled every 20 s.
+ * The battery: BV-T5E, 3000 mAh.
+ */
+#include <kern/clock.h>
+#include <kern/thread.h>
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <pexpert/pexpert.h>
+#include <sys/hakios.input.h>
+#include <sys/systm.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+#define SPMI_PHYS               0xfc4c0000UL
+#define SPMI_SIZE               0x10000UL
+#define SPMI_CMD                0xf800
+#define SPMI_CONFIG             0xf804
+#define SPMI_STATUS             0xf808
+#define SPMI_RDATA0             0xf818
+
+#define PMI                     2
+#define FG_SOC                  0x4009
+#define USB_RT_STS              0x1310
+#define CHGR_STS                0x100e
+#define USB_IL_CFG              0x13f2
+
+#define DESIGN_UAH              3000000
+
+static vm_offset_t spmi;
+
+static const uint32_t usb_limit_ma[32] = { 300, 400, 450, 475, 500, 550, 600, 650, 700, 900, 950, 1000, 1100, 1200, 1400,
+	                                   1450, 1500, 1600, 1800, 1850, 1880, 1910, 1930, 1950, 1970, 2000, 2050, 2100, 2300,
+	                                   2400, 2500, 3000 };
+
+static inline uint32_t
+rd(uint32_t offset)
+{
+	return *(volatile uint32_t *)(spmi + offset);
+}
+
+static inline void
+wr(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(spmi + offset) = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* one byte of a peripheral register: the command (read, slave, peripheral, offset), then status 1 = done */
+static bool
+spmi_read(uint8_t slave, uint16_t address, uint8_t *value)
+{
+	bool ok = false;
+
+	hakios_spmi_lock();
+	if (rd(SPMI_CONFIG) == 0) {             /* a channel somebody else configured is not ours */
+		wr(SPMI_CMD, (1u << 27) | (uint32_t)slave << 20 | (uint32_t)(address >> 8) << 12 | (uint32_t)(address & 0xff) << 4);
+		for (int i = 0; i < 1000; i++) {
+			uint32_t status = rd(SPMI_STATUS);
+
+			if (status != 0) {
+				if (status == 1) {
+					*value = (uint8_t)rd(SPMI_RDATA0);
+					ok = true;
+				}
+				break;
+			}
+			delay_for_interval(1, NSEC_PER_USEC);
+		}
+	}
+	hakios_spmi_unlock();
+	return ok;
+}
+
+static void
+pmi8994_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	struct hakios_battery_state last = { 0 };
+	unsigned failures = 0;
+
+	spmi = ml_io_map(SPMI_PHYS, SPMI_SIZE);
+	for (;;) {
+		uint8_t soc = 0, rt = 0, chgr = 0, il = 0;
+		struct hakios_battery_state b = { .size = sizeof(b) };
+
+		if (!spmi_read(PMI, FG_SOC, &soc) || !spmi_read(PMI, USB_RT_STS, &rt) || !spmi_read(PMI, CHGR_STS, &chgr) ||
+		    !spmi_read(PMI, USB_IL_CFG, &il)) {
+			if (failures++ < 10) {
+				printf("pmi8994: SPMI read failed (arbiter channel config %#x)\n", rd(SPMI_CONFIG));
+			}
+		} else {
+			uint32_t state = chgr >> 1 & 3;
+
+			b.percent_hundredths = (int32_t)((soc * 10000u + 127) / 255);
+			b.present = 1;
+			b.external = (rt & 4) != 0;
+			b.status = b.external && state != 0 ? 1 : b.external && b.percent_hundredths >= 9900 ? 4 : b.external ? 3 : 2;
+			b.temperature_hundredths = -27300;      /* not read yet: "not known" to the thermal and flashlight guards */
+			b.design_uah = b.full_uah = DESIGN_UAH;
+			b.charge_uah = (int32_t)((int64_t)DESIGN_UAH * b.percent_hundredths / 10000);
+			b.usb_type = b.external ? 2 : 0;
+			b.usb_current_ua = b.external ? (int32_t)usb_limit_ma[il & 31] * 1000 : 0;
+			if (b.percent_hundredths / 100 != last.percent_hundredths / 100 || b.external != last.external ||
+			    b.status != last.status || last.size == 0) {
+				printf("pmi8994: %d%%, %s, %s (charger state %u, input limit %u mA)\n", b.percent_hundredths / 100,
+				    b.external ? "power on the USB port" : "on battery",
+				    b.status == 1 ? "charging" : b.status == 4 ? "full" : b.status == 3 ? "not charging" : "discharging",
+				    state, usb_limit_ma[il & 31]);
+			}
+			hakios_battery_report(&b);
+			last = b;
+		}
+		delay_for_interval(20, NSEC_PER_SEC);
+	}
+}
+
+void
+hakios_pmi8994_init(void)
+{
+	uint32_t enabled = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("pmi8994", &enabled, sizeof(enabled)) || !enabled) {
+		return;
+	}
+	if (kernel_thread_start(pmi8994_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}

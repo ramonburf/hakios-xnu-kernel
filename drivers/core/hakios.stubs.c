@@ -80,6 +80,10 @@ void hakios_adreno_stop(void) {}
 void hakios_adreno_minute(void) {}
 #endif
 
+#ifndef HAKIOS_PMI8994
+void hakios_pmi8994_init(void) {}
+#endif
+
 #ifndef HAKIOS_ADRENO4
 void hakios_adreno4_init(void) {}
 #endif
