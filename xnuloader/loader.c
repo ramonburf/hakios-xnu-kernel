@@ -2881,6 +2881,7 @@ static struct {
 
 static void talkman_scanout_move(void);
 static void talkman_scanout_restore(void);
+static void talkman_gpu_probe(int level);
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
@@ -3171,6 +3172,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (drivers/camera/hakios.torch.c) */
 	int torch_requested = 0;
+	/* "gpu_probe=N" there too: the Lumia 950's GPU, bring-up (talkman_gpu_probe) */
+	int gpu_probe = 0;
 	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c) */
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
@@ -3195,6 +3198,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
+		if (starts_with(c, "gpu_probe=") && (c == pi.cmdline || c[-1] == ' ') && c[10] >= '1' && c[10] <= '9') {
+			gpu_probe = c[10] - '0';
+		}
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
@@ -3526,6 +3532,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* Panic log region: RAM outside XNU's window (tail of the payload reservation). */
 	uint64_t pram_reg[2] = { PANIC_LOG_BASE, PANIC_LOG_SIZE };
+	if (gpu_probe && PLAT == &platform_talkman) {
+		talkman_gpu_probe(gpu_probe);
+	}
 	memset((void *)PANIC_LOG_BASE, 0, PANIC_LOG_SIZE);
 	dt_begin(&w, "pram");
 	dt_prop(&w, "reg", pram_reg, sizeof(pram_reg));
@@ -4415,6 +4424,143 @@ va_mapped(uint64_t va)
 		__asm__ volatile ("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1" : "=r" (par) : "r" (va) : "memory");
 	}
 	return !(par & 1);
+}
+
+static void vol_log_note(void);
+
+/*
+ * The Lumia 950's GPU, an Adreno 418 (boot-arg gpu_probe=N, talkman only). The firmware leaves it off: both OxiLi
+ * power domains collapsed, the three branch clocks halted. Bring-up step 1, after the 950 XL port's handset test (UniXNU,
+ * docs/hardware/2026-10-27-native-gpu-initialized-v4.json: domains on, clocks on, RBBM_HW_VERSION 0x51):
+ *   1  log the domains and clocks, and whether the firmware offers its RPM protocol (nothing written)
+ *   2  and: the graphics clock's parent from RPM (clk2 #1, 300000 KHz, through the firmware's own SMD-RPM driver),
+ *      the CX and GX domains on (GDSCR SW_COLLAPSE cleared, PWR_ON polled), the core clock's memory retention bits,
+ *      the AHB, timer and core branches on; then the GPU's RBBM_HW_VERSION and HW_CONFIGURATION read
+ * Registers: MMSS clock controller 0xfd8c0000 (GDSCR GX 0x4024, CX 0x4034; CBCR core 0x4028, AHB 0x403c, timer 0x40b0),
+ * KGSL 0xfdb00000 (msm8992-gpu.dtsi of Qualcomm's msm-3.10 for this SoC). The GPU is left on: nothing uses it yet.
+ */
+#define MMSS_BASE               0xfd8c0000ULL
+#define GPU_BASE                0xfdb00000ULL
+#define GDSCR_GX                0x4024
+#define GDSCR_CX                0x4034
+#define CBCR_GPU_CORE           0x4028
+#define CBCR_GPU_AHB            0x403c
+#define CBCR_GPU_TIMER          0x40b0
+
+typedef struct {
+	int64_t (*rpm_send_data)(uint32_t *data, uint32_t len, uint32_t type);
+	void (*rpm_clk_enable)(uint32_t *data, uint32_t len);
+	uint64_t (*rpm_ldo_pipe_enable)(void);
+	uint64_t (*rpm_ldo30_enable)(void);
+} qcom_rpm_protocol;
+
+static uint32_t
+mmss_rd(uint32_t offset)
+{
+	return *(volatile uint32_t *)(MMSS_BASE + offset);
+}
+
+static void
+mmss_wr(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(MMSS_BASE + offset) = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+gpu_show(const char *when)
+{
+	print("gpu: %s: GDSCR gx %x cx %x, CBCR core %x ahb %x timer %x\n", when, (uint64_t)mmss_rd(GDSCR_GX),
+	    (uint64_t)mmss_rd(GDSCR_CX), (uint64_t)mmss_rd(CBCR_GPU_CORE), (uint64_t)mmss_rd(CBCR_GPU_AHB),
+	    (uint64_t)mmss_rd(CBCR_GPU_TIMER));
+}
+
+/* a power domain on: SW_COLLAPSE cleared, everything else as the firmware left it; PWR_ON within 1000 us */
+static int
+gpu_domain_on(uint32_t offset, const char *name)
+{
+	uint32_t v = mmss_rd(offset);
+
+	if (v & (1u << 1)) {
+		print("gpu: %s domain is under hardware control (%x): left alone\n", name, (uint64_t)v);
+		return 0;
+	}
+	mmss_wr(offset, v & ~1u);
+	for (int i = 0; i < 1000; i++) {
+		if (mmss_rd(offset) & (1u << 31)) {
+			return 1;
+		}
+		BS->stall(1);
+	}
+	print("gpu: %s domain did not come on (%x)\n", name, (uint64_t)mmss_rd(offset));
+	return 0;
+}
+
+/* a branch clock on: its enable bit, then CLK_OFF (bit 31) cleared within 1000 us */
+static int
+gpu_branch_on(uint32_t offset, const char *name)
+{
+	mmss_wr(offset, mmss_rd(offset) | 1u);
+	for (int i = 0; i < 1000; i++) {
+		if (!(mmss_rd(offset) & (1u << 31))) {
+			return 1;
+		}
+		BS->stall(1);
+	}
+	print("gpu: the %s clock stays off (%x)\n", name, (uint64_t)mmss_rd(offset));
+	return 0;
+}
+
+static void
+talkman_gpu_probe(int level)
+{
+	static const efi_guid rpm_guid = { 0x10c51490, 0xd3b6, 0x45de, { 0xb6, 0xfc, 0x8f, 0x46, 0xa2, 0xeb, 0x8e, 0x01 } };
+	qcom_rpm_protocol *rpm = NULL;
+
+	if (!va_mapped(MMSS_BASE) || !va_mapped(MMSS_BASE + 0x4000)) {
+		print("gpu: the MMSS clock controller is not mapped by the firmware: not looked at\n");
+		return;
+	}
+	gpu_show("as found");
+	if (EFI_ERROR(BS->locate_protocol(&rpm_guid, NULL, (void **)&rpm)) || rpm == NULL) {
+		rpm = NULL;
+	}
+	print("gpu: the firmware's RPM protocol: %s\n", rpm ? "there" : "NOT there (its SMD-RPM channel is closed)");
+	if (level < 2) {
+		return;
+	}
+	if (rpm != NULL) {
+		/* resource type "clk2", id 1 (the graphics clock's parent), key "KHz", 4 bytes: the boot level, 300 MHz */
+		uint32_t vote[] = { 0x326b6c63, 1, 0x007a484b, 4, 300000 };
+
+		print("gpu: asking RPM for the graphics clock (clk2 #1, 300000 KHz)\n");
+		vol_log_note();
+		print("gpu: RPM answers %d\n", (uint64_t)rpm->rpm_send_data(vote, 12, 0 /* RPM_REQUEST_TYPE */));
+	}
+	print("gpu: powering the CX and GX domains\n");
+	vol_log_note();
+	if (!gpu_domain_on(GDSCR_CX, "CX") || !gpu_domain_on(GDSCR_GX, "GX")) {
+		gpu_show("after the domains");
+		return;
+	}
+	mmss_wr(CBCR_GPU_CORE, mmss_rd(CBCR_GPU_CORE) | 0x6000);       /* FORCE_MEM_CORE_ON | FORCE_MEM_PERIPH_ON */
+	print("gpu: domains on; the AHB, timer and core clocks\n");
+	vol_log_note();
+	if (!gpu_branch_on(CBCR_GPU_AHB, "AHB") || !gpu_branch_on(CBCR_GPU_TIMER, "timer") ||
+	    !gpu_branch_on(CBCR_GPU_CORE, "core")) {
+		gpu_show("after the clocks");
+		return;
+	}
+	gpu_show("powered");
+	if (!va_mapped(GPU_BASE)) {
+		print("gpu: its registers (%x) are not mapped by the firmware\n", GPU_BASE);
+		return;
+	}
+	print("gpu: reading RBBM_HW_VERSION\n");
+	vol_log_note();
+	print("gpu: RBBM_HW_VERSION %x, HW_CONFIGURATION %x, RBBM_STATUS %x\n", (uint64_t)*(volatile uint32_t *)GPU_BASE,
+	    (uint64_t)*(volatile uint32_t *)(GPU_BASE + (0x0002 << 2)), (uint64_t)*(volatile uint32_t *)(GPU_BASE + (0x0191 << 2)));
+	vol_log_note();
 }
 
 /* The MDSS source pipes found fetching the firmware's framebuffer (bit n: talkman_mdss_probe's pipes[n]) */
