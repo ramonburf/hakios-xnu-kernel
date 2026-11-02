@@ -58,7 +58,7 @@ USER = re.compile(r'strstr\(\s*(?:arguments|args|argument)\s*,\s*"([a-z][a-z0-9_
 
 # the group an argument is listed under: by the file that reads it (the first match decides)
 GROUPS = [
-    ("GPU and display", r"hakios\.(adreno|gpu)\.|MiniIO(Surface|MobileFramebuffer)|gl_osmesa|eagl\.c"),
+    ("GPU and display", r"hakios\.(adreno|adreno4|gpu)\.|MiniIO(Surface|MobileFramebuffer)|gl_osmesa|eagl\.c"),
     ("Security stand-ins", r"kern_minimac|miniamfi"),
     ("Wi-Fi", r"hakios\.(wifi|wlfw|lx|sta|apple80211)\.|^lx_[a-z0-9]+\.c$"),     # wifi/lx/src/lx_*.c: the Linux layer
     ("Cellular", r"hakios\.(mpss|ipa|cell|nas|qmi)\."),

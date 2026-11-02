@@ -7,3 +7,9 @@ driver ADRENO
 	file    iokit/Kernel/hakios.gpu.cpp iokitcpp
 	help    the Adreno 642L of the SC7280 woken step by step (adreno=N), and HakiosGPU, the IOKit service Mesa and
 	help    the window server draw through (gpu=1, adreno_keep=1). Needs the GPU's firmware from the phone (fw-gpu/)
+
+driver ADRENO4
+	file    bsd/dev/hakios.adreno4.c
+	default n
+	help    the Lumia 950's Adreno 418 (a4xx), bring-up: its identity and its SMMU context banks read once the loader
+	help    has powered it (gpu4=1, with the loader's gpu_probe=2)

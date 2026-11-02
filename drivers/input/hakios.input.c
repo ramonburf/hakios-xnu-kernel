@@ -234,6 +234,7 @@ hakios_input_init(void)
 	hakios_ufs_init();
 	hakios_net_init();
 	hakios_adreno_init();
+	hakios_adreno4_init();
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();

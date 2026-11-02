@@ -138,10 +138,12 @@ gltrace_uniforms	u
 glwait	u
 glyes	u
 gpu	k
+gpu4	k
 gpu_cached	k
 gpu_exact	k
 gpu_keep	k
 gpu_log	k
+gpu_probe	l
 hakios_kver	k
 haptic	k
 haptic_effect	k

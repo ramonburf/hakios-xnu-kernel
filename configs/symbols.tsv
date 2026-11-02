@@ -128,10 +128,12 @@ GLTRACE_SHADERS	arg	gltrace_shaders	GPU and display	u	eagl.c	the text of the sha
 GLTRACE_UNIFORMS	arg	gltrace_uniforms	GPU and display	u	eagl.c	what the program of a traced draw was given, by the names its shaders use (coord_arg, texmat0, ...)
 GLWAIT	arg	glwait	GPU and display	u	eagl.c	
 GLYES	arg	glyes	User space	u	inject.c	the renderer is made to answer that it has those functions after all
+GPU4	arg	gpu4	GPU and display	k	hakios.adreno4.c	
 GPU_CACHED	arg	gpu_cached	GPU and display	k	hakios.gpu.cpp	
 GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c	
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
+GPU_PROBE	arg	gpu_probe	Loader	l	loader.c	
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
 LOG_POC	arg	log_poc	CPU, memory and boot	k	loader_return.c	
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
