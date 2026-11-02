@@ -302,6 +302,7 @@ virtio_net	k
 virtio_sound	k
 vtimer_ppi	k
 wifi	k
+wifi950	k
 wifi_again	k
 wifi_ask	k
 wifi_ba	k
@@ -321,6 +322,7 @@ wifi_mac	k
 wifi_mission	k
 wifi_new	k
 wifi_pause	k
+wifi_probe	l
 wifi_quiet	k
 wifi_radio_read	k
 wifi_ready	k

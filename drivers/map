@@ -51,6 +51,7 @@ wifi     bsd/dev/hakios.lx.c
 wifi     bsd/dev/hakios.sta.c
 wifi     bsd/dev/hakios.apple80211.c
 wifi     iokit/Kernel/hakios.wlan.cpp
+wifi     bsd/dev/hakios.qca6174.c
 
 modem    bsd/dev/hakios.mpss.c
 modem    bsd/dev/hakios.cell.c
