@@ -133,8 +133,7 @@ pmi8994_thread(__unused void *parameter, __unused wait_result_t result)
 				spmi_read(PMI, USB_CMD_IL, &cmd_il);
 				spmi_read(PMI, USB_ICL_STS1, &icl);
 				printf("pmi8994: charger: CHGR_STS %#x RT_STS %#x CFG2 %#x; BAT_IF RT_STS %#x CMD_CHG %#x; USB RT_STS %#x "
-				    "CMD_IL %#x ICL_STS1 %#x IL_CFG %#x
-", chgr, chg_rt, cfg2, bat_rt, cmd_chg, rt, cmd_il, icl, il);
+				    "CMD_IL %#x ICL_STS1 %#x IL_CFG %#x\n", chgr, chg_rt, cfg2, bat_rt, cmd_chg, rt, cmd_il, icl, il);
 				printf("pmi8994: %d%%, %s, %s (charger state %u, input limit %u mA)\n", b.percent_hundredths / 100,
 				    b.external ? "power on the USB port" : "on battery",
 				    b.status == 1 ? "charging" : b.status == 4 ? "full" : b.status == 3 ? "not charging" : "discharging",
