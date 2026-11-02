@@ -47,7 +47,12 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define PANIC_LOG_SIZE      0x80000u
 #define NVRAM_BANK_SIZE     0x2000u
 #define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
-#define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
+/*
+ * RAM for the payload: 64 MiB, reserved in the UEFI memory map where the payload sits at a fixed address; 128 MiB where
+ * the loader takes it from the free RAM itself (the Lumia 950), whose payload with Sileo's prefix is 68 MB.
+ */
+static uint64_t payload_max_size = 0x04000000ULL;
+#define PAYLOAD_MAX_SIZE    payload_max_size
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -2873,6 +2878,9 @@ static struct {
 	uint64_t base;
 	uint32_t width, height, stride;
 } SCREEN;
+
+static void talkman_scanout_move(void);
+static void talkman_scanout_restore(void);
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
@@ -3256,6 +3264,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	ba->memSize = win_size;
 	ba->memSizeActual = win_size;
 	ba->topOfKernelData = top;
+	/* the Lumia 950: the panel shows a framebuffer of the kernel's, out of reach of the firmware's debug text */
+	if (PLAT == &platform_talkman) {
+		talkman_scanout_move();
+	}
 	/* any display the firmware has set up: the phone's panel, or QEMU's ramfb */
 	if (SCREEN.base != 0) {
 		/*
@@ -3669,6 +3681,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
 			screen_quiet = screen_quiet_before_run;
+			talkman_scanout_restore();
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
@@ -3699,6 +3712,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* --- the kernel came back ------------------------------------------- */
 	screen_quiet = screen_quiet_before_run;
+	talkman_scanout_restore();
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
 	if (hc_known) {
@@ -4403,6 +4417,75 @@ va_mapped(uint64_t va)
 	return !(par & 1);
 }
 
+/* The MDSS source pipes found fetching the firmware's framebuffer (bit n: talkman_mdss_probe's pipes[n]) */
+static uint32_t mdss_scanout_pipes;
+static uint64_t mdss_scanout_from, mdss_scanout_to;
+
+static const uint32_t mdss_pipe_offsets[] = { 0x5000, 0x7000, 0x9000, 0x15000, 0x17000, 0x19000, 0x25000, 0x27000 };
+/* their bits in a control path's FLUSH register (MDP5: VIG0-2 0-2, RGB0-2 3-5, DMA0-1 11-12) */
+static const uint32_t mdss_pipe_flush[] = { 1u << 0, 1u << 1, 1u << 2, 1u << 3, 1u << 4, 1u << 5, 1u << 11, 1u << 12 };
+
+/* Every pipe that fetched the firmware's framebuffer fetches `to` from the next frame on. */
+static void
+mdss_scanout_point(uint64_t to)
+{
+	const uint64_t mdss = 0xfd900000ULL;
+	uint32_t flush = 0;
+
+	for (unsigned i = 0; i < sizeof(mdss_pipe_offsets) / sizeof(mdss_pipe_offsets[0]); i++) {
+		if (mdss_scanout_pipes & (1u << i)) {
+			*(volatile uint32_t *)(mdss + mdss_pipe_offsets[i] + 0x14) = (uint32_t)to;     /* SSPP_SRC0_ADDR */
+			flush |= mdss_pipe_flush[i];
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	/* the two control paths that drive the panel's halves (ctl0 and ctl1: their layer registers name the pipes) */
+	*(volatile uint32_t *)(mdss + 0x2000 + 0x18) = flush;
+	*(volatile uint32_t *)(mdss + 0x2200 + 0x18) = flush;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/*
+ * The firmware (a DEBUG build of Lumia950XLPkg) draws its debug output into the framebuffer it gave, and it is called on
+ * core 0 for every storage request of a run: its text lay over iOS. For the run, the screen is a copy of that framebuffer
+ * in memory of the loader's own -- below 0x80000000, out of the kernel's window -- and the kernel is told to draw there;
+ * the firmware goes on drawing where the panel no longer looks. talkman_scanout_restore() puts it back.
+ */
+static void
+talkman_scanout_move(void)
+{
+	uint64_t bytes = SCREEN.stride * SCREEN.height, address = 0x7fffffffULL;
+
+	if (mdss_scanout_pipes == 0 || SCREEN.base == 0 || mdss_scanout_to != 0) {
+		return;
+	}
+	if (EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 2 /* EfiLoaderData */, (bytes + 0xfff) / 0x1000,
+	    &address))) {
+		print("mdss: no memory for a screen of the kernel's own: the firmware's text stays on screen\n");
+		return;
+	}
+	memcpy((void *)(uintptr_t)address, (const void *)(uintptr_t)SCREEN.base, bytes);
+	clean_dcache(address, address + bytes);
+	mdss_scanout_from = SCREEN.base;
+	mdss_scanout_to = address;
+	mdss_scanout_point(address);
+	print("mdss: the panel shows %x now (pipes %x), the kernel draws there; the firmware's text goes to %x\n", address,
+	    (uint64_t)mdss_scanout_pipes, mdss_scanout_from);
+	SCREEN.base = address;
+}
+
+static void
+talkman_scanout_restore(void)
+{
+	if (mdss_scanout_to == 0) {
+		return;
+	}
+	mdss_scanout_point(mdss_scanout_from);
+	SCREEN.base = mdss_scanout_from;
+	print("mdss: the panel shows the firmware's framebuffer %x again\n", mdss_scanout_from);
+	mdss_scanout_to = 0;            /* (its pages stay the loader's: the next run takes new ones) */
+}
+
 /*
  * The Lumia 950's display controller (MDSS at 0xfd900000, the MDP 0x1000 into it; pipe and control offsets from the
  * phone's own device tree, qcom,mdss_mdp@fd900000), read only: which source pipe fetches the framebuffer the firmware
@@ -4418,6 +4501,7 @@ talkman_mdss_probe(uint64_t fb)
 	static const uint32_t ctls[] = { 0x2000, 0x2200, 0x2400 };
 	const uint64_t mdss = 0xfd900000ULL;
 
+	mdss_scanout_pipes = 0;
 	if (!va_mapped(mdss) || !va_mapped(mdss + 0x1000) || !va_mapped(mdss + 0x28000)) {
 		print("mdss: not mapped by the firmware: not looked at\n");
 		return;
@@ -4435,6 +4519,9 @@ talkman_mdss_probe(uint64_t fb)
 				print("mdss: %s at +%x: src size %x out size %x addr %x stride %x format %x%s\n", names[i],
 				    base + pipes[i] - mdss, (uint64_t)size, (uint64_t)p[0x08 / 4], (uint64_t)addr, (uint64_t)ystride,
 				    (uint64_t)format, addr == (uint32_t)fb ? "  <- THE FRAMEBUFFER" : "");
+				if (b == 0 && addr == (uint32_t)fb) {
+					mdss_scanout_pipes |= 1u << i;
+				}
 			}
 		}
 		for (unsigned i = 0; i < sizeof(ctls) / sizeof(ctls[0]); i++) {
@@ -4610,7 +4697,7 @@ load_payload_from_volume(void)
 	}
 	size = *(uint64_t *)(info + EFI_FILE_INFO_FILE_SIZE_OFFSET);
 	if (size < sizeof(struct payload_header) || size > PAYLOAD_MAX_SIZE - 0x100000ULL) {
-		volume_payload_note = "\\EFI\\hakios\\payload.bin is empty or does not fit in the payload region (63 MiB)";
+		volume_payload_note = "\\EFI\\hakios\\payload.bin is empty or does not fit in the payload region (less its last MiB)";
 		goto close;
 	}
 	/*
@@ -4628,7 +4715,7 @@ load_payload_from_volume(void)
 		 */
 		address = 0xE0000000ULL - 1;
 		if (EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 2 /* EfiLoaderData */, pages, &address))) {
-			volume_payload_note = "there are no 64 MiB of free RAM below 0xE0000000 for the payload";
+			volume_payload_note = "there is not RAM enough for the payload region below 0xE0000000";
 			goto close;
 		}
 		payload_base = address;
@@ -4777,6 +4864,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	 */
 	if (talkman && !ram_covers(PAYLOAD_BASE_FIXED, PAYLOAD_MAX_SIZE)) {
 		payload_base = 0;
+		payload_max_size = 0x08000000ULL;
 		print("no RAM at %x: the payload can only come from the volume\n", PAYLOAD_BASE_FIXED);
 	}
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
