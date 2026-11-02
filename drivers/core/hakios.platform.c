@@ -19,6 +19,29 @@
 
 #include "hakios.drivers.h"
 
+/*
+ * A line said by a driver: printf, and into the loader's log as well. The loader's log takes the kernel's console,
+ * and the console is off unless the boot is verbose (-v); the Lumia 950 boots without it (its text console drew over
+ * Darwin), and there not one driver's line reached the loader (boots 20 to 29). Darwin's processes write to
+ * /dev/console, which goes to the log either way.
+ */
+extern void loader_log_line(const char *line);
+
+int
+hakios_say(const char *format, ...)
+{
+	char line[512];
+	va_list list;
+	int length;
+
+	va_start(list, format);
+	length = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	printf("%s", line);
+	loader_log_line(line);
+	return length;
+}
+
 /* kern.hakios: the node every driver of this port hangs its sysctls under (it was hakios.battery.c's) */
 SYSCTL_NODE(_kern, OID_AUTO, hakios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
 

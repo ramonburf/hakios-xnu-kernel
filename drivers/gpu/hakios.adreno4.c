@@ -16,7 +16,10 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/hakios.input.h>
 #include <sys/systm.h>
+
+#define printf hakios_say      /* (into the loader's log too: the 950 boots without -v) */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);

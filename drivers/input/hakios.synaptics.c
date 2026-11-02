@@ -74,7 +74,7 @@ say(const char *format, ...)
 	va_start(list, format);
 	length = vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	printf("%s", line);
+	hakios_say("%s", line);
 	if (length > 0) {
 		size_t n = strnlen(line, sizeof(line));
 

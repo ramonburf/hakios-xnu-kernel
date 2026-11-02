@@ -76,6 +76,7 @@ struct hakios_battery_state {
 void hakios_battery_report(const struct hakios_battery_state *state);
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
+int hakios_say(const char *format, ...) __printflike(1, 2);    /* printf, and into the loader's log even without -v */
 void hakios_qca6174_init(void);        /* boot-arg wifi950=1: the Lumia 950's QCA6174 Wi-Fi on PCIe, bring-up */
 void hakios_pmi8994_init(void);        /* boot-arg pmi8994=1: the Lumia 950's battery and charger (PMI8994) */
 void hakios_adreno4_init(void);        /* boot-arg gpu4=1: the Lumia 950's Adreno 418, bring-up */
