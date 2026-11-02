@@ -5,6 +5,10 @@ name: kernel-talkman
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'runner label (macos-latest is arm64; its queue was hours long on 2 November)'
+        default: 'macos-15-intel'
   push:
     branches: [talkman]
     paths:
@@ -30,7 +34,7 @@ concurrency:
 
 jobs:
   kernel:
-    runs-on: macos-latest
+    runs-on: ${{ github.event.inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     env:
       HAKIOS_GIC: v2
