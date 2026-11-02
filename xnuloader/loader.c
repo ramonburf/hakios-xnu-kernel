@@ -4971,8 +4971,29 @@ vol_log_open(void)
 		return;
 	}
 	marker->close(marker);
-	/* an old log goes first: a shorter new one written over it would keep the old one's tail */
+	/*
+	 * An old log goes first: a shorter new one written over it would keep the old one's tail. It is kept as
+	 * loader-prev.log: a run that ended in a reset is followed by a start of this loader before anyone can reach
+	 * the volume (boot 27 kept 182 bytes of the second start and nothing of the run before it).
+	 */
 	if (!EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && file != NULL) {
+		static const char16 prev_path[] = u"\\EFI\\hakios\\loader-prev.log";
+		static char prev[sizeof(log_buf)];
+		uint64_t n = sizeof(prev);
+		efi_file *keep = NULL;
+
+		if (!EFI_ERROR(file->read(file, &n, prev)) && n > 0) {
+			if (!EFI_ERROR(root->open(root, &keep, prev_path, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && keep) {
+				keep->remove(keep);
+				keep = NULL;
+			}
+			if (!EFI_ERROR(root->open(root, &keep, prev_path,
+			    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0)) && keep) {
+				keep->write(keep, &n, prev);
+				keep->flush(keep);
+				keep->close(keep);
+			}
+		}
 		file->remove(file);
 		file = NULL;
 	}
