@@ -1976,9 +1976,10 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks < BLOCK_DARWIN_MIN ||
+	} else if ((bp->block_size != 4096 && bp->block_size != 512) || bp->blocks * bp->block_size < BLOCK_DARWIN_MIN * 4096 ||
 	    info->end_lba - info->start_lba + 1 != bp->blocks) {
-		why = "it is not 20 GiB in blocks of 4096";
+		/* UFS's blocks of 4096, or an eMMC's of 512 (the Lumia 950): the bounds are bytes either way */
+		why = "it is not 20 GiB in blocks of 4096 or 512";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
@@ -2249,7 +2250,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
+			if (block_write_part < 0 || part != (uint32_t)block_write_part ||
+			    lba * block_shared.part[part].block_size < BLOCK_WRITE_FIRST * 4096) {
 				/* not darwin, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
@@ -4387,6 +4389,63 @@ is_talkman_cpu(void)
 	return ((midr >> 24) & 0xff) == 0x41 && (part == 0xD03 || part == 0xD07);
 }
 
+/* Is this virtual address mapped in the firmware's tables? (A stage 1 translation, read only, faults nothing.) */
+static int
+va_mapped(uint64_t va)
+{
+	uint64_t par;
+
+	if ((READ_SYSREG(CurrentEL) >> 2) == 2) {
+		__asm__ volatile ("at s1e2r, %1\n\tisb\n\tmrs %0, par_el1" : "=r" (par) : "r" (va) : "memory");
+	} else {
+		__asm__ volatile ("at s1e1r, %1\n\tisb\n\tmrs %0, par_el1" : "=r" (par) : "r" (va) : "memory");
+	}
+	return !(par & 1);
+}
+
+/*
+ * The Lumia 950's display controller (MDSS at 0xfd900000, the MDP 0x1000 into it; pipe and control offsets from the
+ * phone's own device tree, qcom,mdss_mdp@fd900000), read only: which source pipe fetches the framebuffer the firmware
+ * gave. The firmware is a DEBUG build that draws its debug output into that framebuffer (the text over iOS, called
+ * on core 0 by every storage request); moving the scanout to memory of the kernel's own leaves it drawing where nobody
+ * looks. This says where to move it from.
+ */
+static void
+talkman_mdss_probe(uint64_t fb)
+{
+	static const uint32_t pipes[] = { 0x5000, 0x7000, 0x9000, 0x15000, 0x17000, 0x19000, 0x25000, 0x27000 };
+	static const char *const names[] = { "vig0", "vig1", "vig2", "rgb0", "rgb1", "rgb2", "dma0", "dma1" };
+	static const uint32_t ctls[] = { 0x2000, 0x2200, 0x2400 };
+	const uint64_t mdss = 0xfd900000ULL;
+
+	if (!va_mapped(mdss) || !va_mapped(mdss + 0x1000) || !va_mapped(mdss + 0x28000)) {
+		print("mdss: not mapped by the firmware: not looked at\n");
+		return;
+	}
+	print("mdss: hw version %x, mdp hw version %x; the framebuffer is %x\n", (uint64_t)*(volatile uint32_t *)mdss,
+	    (uint64_t)*(volatile uint32_t *)(mdss + 0x1000), fb);
+	for (unsigned b = 0; b < 2; b++) {
+		uint64_t base = mdss + (b ? 0x1000 : 0);
+
+		for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
+			volatile uint32_t *p = (volatile uint32_t *)(base + pipes[i]);
+			uint32_t size = p[0], addr = p[0x14 / 4], ystride = p[0x24 / 4], format = p[0x30 / 4];
+
+			if (addr != 0 || size != 0) {
+				print("mdss: %s at +%x: src size %x out size %x addr %x stride %x format %x%s\n", names[i],
+				    base + pipes[i] - mdss, (uint64_t)size, (uint64_t)p[0x08 / 4], (uint64_t)addr, (uint64_t)ystride,
+				    (uint64_t)format, addr == (uint32_t)fb ? "  <- THE FRAMEBUFFER" : "");
+			}
+		}
+		for (unsigned i = 0; i < sizeof(ctls) / sizeof(ctls[0]); i++) {
+			volatile uint32_t *c = (volatile uint32_t *)(base + ctls[i]);
+
+			print("mdss: ctl%d at +%x: layer %x %x %x top %x flush %x\n", (uint64_t)i, base + ctls[i] - mdss,
+			    (uint64_t)c[0], (uint64_t)c[1], (uint64_t)c[2], (uint64_t)c[0x14 / 4], (uint64_t)c[0x18 / 4]);
+		}
+	}
+}
+
 /*
  * A log file on the loader's own volume, for a phone with no logdump partition (the Lumia 950):
  * \EFI\hakios\loader.log, made anew at each start and written whole, flushed, at every checkpoint, so that a
@@ -4760,6 +4819,9 @@ efi_main(efi_handle image, efi_system_table *st)
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+		if (talkman) {
+			talkman_mdss_probe(SCREEN.base);
+		}
 	}
 	print("platform %s\n", PLAT->name);
 	/* read by loader_return_stub, part of it with the caches off: the value must be in memory */

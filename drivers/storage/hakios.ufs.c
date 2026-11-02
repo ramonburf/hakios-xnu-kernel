@@ -612,7 +612,7 @@ ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint6
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	if (offset < UFS_WRITE_FIRST * 4096 || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the Darwin volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -712,8 +712,9 @@ ufs_data_flush(void)
 	}
 	lck_mtx_lock(&ufs_write_mtx);
 	lck_mtx_lock(&ufs_lock);
-	/* one block in bounds, for the loader's checks; nothing of it is touched */
-	error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_FLUSH, (uint32_t)ufs_write_part, UFS_WRITE_FIRST, 1, NULL, NULL);
+	/* one block in bounds, for the loader's checks (in the partition's own blocks: 512 bytes on the Lumia 950); nothing of it is touched */
+	error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_FLUSH, (uint32_t)ufs_write_part,
+	    UFS_WRITE_FIRST * 4096 / ufs_page->part[ufs_write_part].block_size, 1, NULL, NULL);
 	lck_mtx_unlock(&ufs_lock);
 	lck_mtx_unlock(&ufs_write_mtx);
 	return error;
@@ -1787,10 +1788,11 @@ hakios_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].blocks < UFS_DARWIN_MIN) {
+			} else if (ufs_page->part[i].block_size != 4096 && ufs_page->part[i].block_size != 512) {
+				/* UFS's blocks of 4096, or an eMMC's of 512 (the Lumia 950); the bounds are in bytes either way */
+				why = "its blocks are neither 4096 nor 512 bytes";
+			} else if (ufs_page->part[i].blocks * ufs_page->part[i].block_size < UFS_DARWIN_MIN * 4096) {
 				why = "it is smaller than the layout's 20 GiB";
-			} else if (ufs_page->part[i].block_size != 4096) {
-				why = "its blocks are not 4096 bytes";
 			}
 			if (why != NULL) {
 				printf("ufs: darwin: no write will be asked for: %s\n", why);
@@ -1800,8 +1802,8 @@ hakios_ufs_init(void)
 		}
 		if (ufs_write_part >= 0) {
 			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (ufs_page->part[ufs_write_part].blocks - UFS_WRITE_FIRST) * 4096 >> 20);
+			    "everything else of the storage is read only\n",
+			    UFS_WRITE_FIRST * 4096 / ufs_page->part[ufs_write_part].block_size, ufs_data_bytes() >> 20);
 			if (devfs_make_node(makedev(ufs_bmajor, UFS_DATA_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
 			    "ufs_darwin_data") != NULL) {
 				printf("ufs: /dev/ufs_darwin_data: the same %llu MB as a block device, for the data volume; "
