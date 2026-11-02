@@ -39,6 +39,13 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define USB_RT_STS              0x1310
 #define CHGR_STS                0x100e
 #define USB_IL_CFG              0x13f2
+/* for the charger's own state, logged when it changes (qpnp-smbcharger.c: CHGR 0x1000, BAT_IF 0x1200, USB_CHGPTH 0x1300) */
+#define CHGR_RT_STS             0x1010
+#define CHGR_CFG2               0x10fc          /* bit 7 CHG_EN_SRC (command register), bit 6 CHG_EN_POLARITY */
+#define BAT_IF_RT_STS           0x1210
+#define BAT_IF_CMD_CHG          0x1242          /* bit 1 EN_BAT_CHG (its sense set by CHGR_CFG2), bit 0 OTG */
+#define USB_CMD_IL              0x1340          /* bit 0 USBIN_MODE_HC, bit 1 USB 9/1.5, bit 2 USBIN_SUSPEND */
+#define USB_ICL_STS1            0x1307
 
 #define DESIGN_UAH              3000000
 
@@ -117,6 +124,17 @@ pmi8994_thread(__unused void *parameter, __unused wait_result_t result)
 			b.usb_current_ua = b.external ? (int32_t)usb_limit_ma[il & 31] * 1000 : 0;
 			if (b.percent_hundredths / 100 != last.percent_hundredths / 100 || b.external != last.external ||
 			    b.status != last.status || last.size == 0) {
+				uint8_t chg_rt = 0, cfg2 = 0, bat_rt = 0, cmd_chg = 0, cmd_il = 0, icl = 0;
+
+				spmi_read(PMI, CHGR_RT_STS, &chg_rt);
+				spmi_read(PMI, CHGR_CFG2, &cfg2);
+				spmi_read(PMI, BAT_IF_RT_STS, &bat_rt);
+				spmi_read(PMI, BAT_IF_CMD_CHG, &cmd_chg);
+				spmi_read(PMI, USB_CMD_IL, &cmd_il);
+				spmi_read(PMI, USB_ICL_STS1, &icl);
+				printf("pmi8994: charger: CHGR_STS %#x RT_STS %#x CFG2 %#x; BAT_IF RT_STS %#x CMD_CHG %#x; USB RT_STS %#x "
+				    "CMD_IL %#x ICL_STS1 %#x IL_CFG %#x
+", chgr, chg_rt, cfg2, bat_rt, cmd_chg, rt, cmd_il, icl, il);
 				printf("pmi8994: %d%%, %s, %s (charger state %u, input limit %u mA)\n", b.percent_hundredths / 100,
 				    b.external ? "power on the USB port" : "on battery",
 				    b.status == 1 ? "charging" : b.status == 4 ? "full" : b.status == 3 ? "not charging" : "discharging",

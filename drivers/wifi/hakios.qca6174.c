@@ -7,8 +7,8 @@
  * region 1 at the endpoint's configuration space (0xff100000, bus 1). The endpoint answers 168c:003e, class 0x0280,
  * with a 64-bit memory BAR0 of 2 MB that nobody has given an address.
  *
- * Here: iATU region 2 for memory, CPU 0xff300000..0xff4fffff to the same PCI addresses (the "bars" window of the
- * device tree's qcom,pcie@fc520000, 0xff300000 + 0xd00000); BAR0 there; memory and bus mastering on; the chip woken
+ * Here: iATU region 2 for memory, CPU 0xff400000..0xff5fffff to the same PCI addresses (inside the "bars" window of
+ * the device tree's qcom,pcie@fc520000, 0xff300000 + 0xd00000; a BAR of 2 MB must sit on a 2 MB boundary); BAR0 there; memory and bus mastering on; the chip woken
  * (PCIE_SOC_WAKE) and its SoC chip ID read through BAR0 (ath10k's hw.c, QCA6174: RTC_SOC_BASE 0x800, SOC_CHIP_ID
  * +0xf0; PCIE_LOCAL_BASE 0x80000, SOC_WAKE +0x4, RTC_STATE 0x...). Nothing of the radio is started.
  *
@@ -33,7 +33,9 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define PCIE_DBI_SIZE           0x1000UL
 #define PCIE_CONF_PHYS          0xff100000UL
 #define PCIE_CONF_SIZE          0x1000UL
-#define PCIE_BAR_PHYS           0xff300000UL    /* where BAR0 goes, CPU and PCI address alike */
+#define PCIE_BAR_PHYS           0xff400000UL    /* where BAR0 goes, CPU and PCI address alike: 2 MB aligned, as the BAR
+                                                 * is 2 MB (boot 30: 0xff300000 read back as 0xff200000, and BAR0
+                                                 * reads gave 0xdeadbeef) */
 #define PCIE_BAR_SIZE           0x200000UL      /* 2 MB, what BAR0 asks for */
 
 #define ELBI_SYS_STTS           0xf28           /* in dm_core: bit 10, the link is up */
