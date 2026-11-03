@@ -30,4 +30,4 @@ driver PMI8994
 	requires BATTERY
 	default n
 	help    the Lumia 950's battery and charger: the PMI8994's fuel gauge and charger read over SPMI and handed to the
-	help    battery service (pmi8994=1); read only, the PMI8994 charges with the firmware's setup
+	help    battery service (pmi8994=1); charging commanded on (pmi8994_charge=0: left as the firmware set it)

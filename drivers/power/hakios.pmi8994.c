@@ -4,7 +4,7 @@
  * .cpp, the IOPMPowerSource powerd matches for the status bar and Settings > Battery). Only with boot-arg pmi8994=1:
  * every address below belongs to this phone.
  *
- * Read only. The charging itself needs nothing from the kernel: the PMI8994 charges with the setup the firmware gave
+ * Read only but for one bit: charging commanded on (charging_on). Otherwise the charging itself needs nothing from the kernel: the PMI8994 charges with the setup the firmware gave
  * it (the 950 XL port saw a 1500 mA input limit, fast charge, then taper to full). What is read (PMI8994 is SPMI
  * slave 2; the cityman kernel's qpnp-smbcharger.c and qpnp-fg.c, as the 950 XL port's NativeBattery reads them):
  *   FG_SOC 0x4009            the fuel gauge's monotonic state of charge, 0..255
@@ -32,6 +32,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define SPMI_CMD                0xf800
 #define SPMI_CONFIG             0xf804
 #define SPMI_STATUS             0xf808
+#define SPMI_WDATA0             0xf810
 #define SPMI_RDATA0             0xf818
 
 #define PMI                     2
@@ -94,6 +95,58 @@ spmi_read(uint8_t slave, uint16_t address, uint8_t *value)
 	return ok;
 }
 
+/* one byte into a peripheral register: the byte in WDATA0, then the command (opcode 0, extended write, one byte) */
+static bool
+spmi_write(uint8_t slave, uint16_t address, uint8_t value)
+{
+	bool ok = false;
+
+	hakios_spmi_lock();
+	if (rd(SPMI_CONFIG) == 0) {
+		wr(SPMI_WDATA0, value);
+		wr(SPMI_CMD, (uint32_t)slave << 20 | (uint32_t)(address >> 8) << 12 | (uint32_t)(address & 0xff) << 4);
+		for (int i = 0; i < 1000; i++) {
+			uint32_t status = rd(SPMI_STATUS);
+
+			if (status != 0) {
+				ok = status == 1;
+				break;
+			}
+			delay_for_interval(1, NSEC_PER_USEC);
+		}
+	}
+	hakios_spmi_unlock();
+	return ok;
+}
+
+/*
+ * Charging on (boot-arg pmi8994_charge=0 leaves it as the firmware did). Boot 31: USB power, no battery fault, input
+ * not suspended, and yet not charging -- CHGR_CFG2 0x0b (CHG_EN_SRC 0: the command register decides; CHG_EN_POLARITY
+ * 0: active high) with BAT_IF CMD_CHG 0, i.e. charging commanded off. EN_BAT_CHG (bit 1) set is what
+ * smbchg_charging_en() of qpnp-smbcharger.c writes for that polarity; CMD_CHG is not a secured register.
+ */
+static void
+charging_on(void)
+{
+	uint8_t cfg2 = 0, cmd = 0, after = 0;
+	uint32_t enabled = 1;
+
+	PE_parse_boot_argn("pmi8994_charge", &enabled, sizeof(enabled));
+	if (!enabled || !spmi_read(PMI, CHGR_CFG2, &cfg2) || !spmi_read(PMI, BAT_IF_CMD_CHG, &cmd)) {
+		return;
+	}
+	if (cfg2 & (1u << 7)) {
+		printf("pmi8994: charging is enabled by a pin here (CHGR_CFG2 %#x): left as it is\n", cfg2);
+		return;
+	}
+	if ((cfg2 & (1u << 6)) ? !(cmd & 2) : (cmd & 2)) {
+		return;         /* commanded on already */
+	}
+	spmi_write(PMI, BAT_IF_CMD_CHG, (cfg2 & (1u << 6)) ? (uint8_t)(cmd & ~2u) : (uint8_t)(cmd | 2u));
+	spmi_read(PMI, BAT_IF_CMD_CHG, &after);
+	printf("pmi8994: charging commanded on: CMD_CHG %#x -> %#x (CHGR_CFG2 %#x)\n", cmd, after, cfg2);
+}
+
 static void
 pmi8994_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -101,6 +154,7 @@ pmi8994_thread(__unused void *parameter, __unused wait_result_t result)
 	unsigned failures = 0;
 
 	spmi = ml_io_map(SPMI_PHYS, SPMI_SIZE);
+	charging_on();
 	for (;;) {
 		uint8_t soc = 0, rt = 0, chgr = 0, il = 0;
 		struct hakios_battery_state b = { .size = sizeof(b) };
